@@ -1,0 +1,27 @@
+Shared tokenizer / normalisation test vectors.
+
+mailsearch-core is pinned by these files: an index writer and the reader library link the same
+crate, and CI fails when its output differs from a vector.
+Rules are versioned by norm_version (NORM_VERSION); the version these vectors describe is in the
+`# norm_version:` line of each file. Changing a rule = bump norm_version + update the vectors in the
+same change (the index then rebuilds).
+
+File format (all files): UTF-8, one case per line, fields separated by a single TAB.
+  * Lines starting with `#` are comments; `# norm_version: N` is required once per file.
+  * Column 1 `id`: unique within the file, [a-z0-9_]+.
+  * Column 2 `status`: `spec` = follows directly from the written rule; `inferred` = interprets a rule the
+    text leaves open; confirm or correct when mailsearch-core implements it.
+  * Remaining columns are file-specific (header comment of each file).
+  * Escapes inside fields: \u{XXXX} (one Unicode scalar, 1-6 hex digits), \t, \\ ; an empty field
+    is written as the single character `∅`.
+  * Token lists are separated by a single ASCII space.
+
+Files:
+  normalisation.tsv   N1 normalisation (input -> normalised text, before the tokenizer)
+  words.tsv           word tokenizer after N1 (input -> tokens of the word fields)
+  numbers.tsv         digit-run tokens written to the `numbers` field
+  segmentation.tsv    script routing: word-field tokens and ng_* bigram tokens
+  query.tsv           query compilation of identifier-like tokens into phrases
+
+Status: rule-by-rule parity test: all 58 vectors pass in mailsearch-core and are re-run by
+the reader crate; the one `inferred` case (`han_hiragana_one_run`) is confirmed.

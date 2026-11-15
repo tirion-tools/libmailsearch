@@ -1,0 +1,160 @@
+//! The reader's own read-only Tantivy directory: every file is mapped once and registered, so [`RoDir::advise_all`] can
+//! `madvise(MADV_DONTNEED)` every live mapping and drop its pages from this process. Writes, deletes
+//! and locks are refused: the indexer is the only writer.
+
+use std::collections::HashMap;
+use std::io;
+use std::ops::{Deref, Range};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
+use tantivy::Directory;
+use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
+use tantivy::directory::{
+    DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
+};
+
+struct MapArc(Arc<memmap2::Mmap>);
+impl Deref for MapArc {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+// SAFETY: the bytes live in the mapping the Arc keeps alive; moving the Arc does not move them.
+unsafe impl stable_deref_trait::StableDeref for MapArc {}
+
+#[derive(Debug)]
+struct MapHandle(Arc<memmap2::Mmap>);
+impl tantivy::HasLen for MapHandle {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+impl FileHandle for MapHandle {
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+        if range.end > self.0.len() || range.start > range.end {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past the end of an index file",
+            ));
+        }
+        Ok(OwnedBytes::new(MapArc(self.0.clone())).slice(range))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoDir {
+    root: PathBuf,
+    maps: Arc<Mutex<HashMap<PathBuf, Weak<memmap2::Mmap>>>>,
+}
+
+fn read_err(p: &Path, e: io::Error) -> OpenReadError {
+    if e.kind() == io::ErrorKind::NotFound {
+        OpenReadError::FileDoesNotExist(p.to_path_buf())
+    } else {
+        OpenReadError::IoError {
+            io_error: Arc::new(e),
+            filepath: p.to_path_buf(),
+        }
+    }
+}
+
+fn denied() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "read-only reader")
+}
+
+impl RoDir {
+    pub fn open(root: &Path) -> io::Result<RoDir> {
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not a directory", root.display()),
+            ));
+        }
+        Ok(RoDir {
+            root: root.to_path_buf(),
+            maps: Default::default(),
+        })
+    }
+
+    /// `madvise(MADV_DONTNEED)` on every live mapping. Returns the bytes advised.
+    pub fn advise_all(&self) -> u64 {
+        let mut n = 0u64;
+        let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        maps.retain(|_, w| w.strong_count() > 0);
+        for w in maps.values() {
+            if let Some(m) = w.upgrade()
+                && !m.is_empty()
+            {
+                // SAFETY: the range is exactly one live read-only file mapping held by `m`;
+                // MADV_DONTNEED on a file-backed private read-only mapping only drops pages,
+                // later reads fault them back in from the file.
+                unsafe {
+                    libc::madvise(
+                        m.as_ptr() as *mut libc::c_void,
+                        m.len(),
+                        libc::MADV_DONTNEED,
+                    )
+                };
+                n += m.len() as u64;
+            }
+        }
+        n
+    }
+}
+
+impl Directory for RoDir {
+    fn get_file_handle(&self, p: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = maps.get(p).and_then(|w| w.upgrade()) {
+            return Ok(Arc::new(MapHandle(m)));
+        }
+        let f = std::fs::File::open(self.root.join(p)).map_err(|e| read_err(p, e))?;
+        let len = f.metadata().map_err(|e| read_err(p, e))?.len();
+        let m = if len == 0 {
+            Arc::new(
+                memmap2::MmapOptions::new()
+                    .len(0)
+                    .map_anon()
+                    .and_then(|m| m.make_read_only())
+                    .map_err(|e| read_err(p, e))?,
+            )
+        } else {
+            // SAFETY: index files are immutable once written; the indexer never truncates a file
+            // a reader generation may hold (lease).
+            Arc::new(unsafe { memmap2::Mmap::map(&f) }.map_err(|e| read_err(p, e))?)
+        };
+        maps.insert(p.to_path_buf(), Arc::downgrade(&m));
+        Ok(Arc::new(MapHandle(m)))
+    }
+    fn delete(&self, p: &Path) -> Result<(), DeleteError> {
+        Err(DeleteError::IoError {
+            io_error: Arc::new(denied()),
+            filepath: p.to_path_buf(),
+        })
+    }
+    fn exists(&self, p: &Path) -> Result<bool, OpenReadError> {
+        Ok(self.root.join(p).exists())
+    }
+    fn open_write(&self, p: &Path) -> Result<WritePtr, OpenWriteError> {
+        Err(OpenWriteError::IoError {
+            io_error: Arc::new(denied()),
+            filepath: p.to_path_buf(),
+        })
+    }
+    fn atomic_read(&self, p: &Path) -> Result<Vec<u8>, OpenReadError> {
+        std::fs::read(self.root.join(p)).map_err(|e| read_err(p, e))
+    }
+    fn atomic_write(&self, _p: &Path, _data: &[u8]) -> io::Result<()> {
+        Err(denied())
+    }
+    fn sync_directory(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
+        Ok(DirectoryLock::from(Box::new(())))
+    }
+    fn watch(&self, _cb: WatchCallback) -> tantivy::Result<WatchHandle> {
+        Ok(WatchHandle::empty())
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "mailsearch"
+description = "libmailsearch: the search engine over a read-only Tantivy mail index, with a C ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mailsearch"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mailsearch-core.workspace = true
+tantivy.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+stable_deref_trait.workspace = true
+
+[lints]
+workspace = true

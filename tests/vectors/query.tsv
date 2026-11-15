@@ -1,0 +1,8 @@
+# Query compilation: a query token containing @ . - _ / : becomes a phrase of its
+# parts; a plain word stays a term.
+# norm_version: 1
+# id	status	query_token	compiled
+address_phrase	spec	alice@example.com	"alice example com"
+identifier_phrase	spec	INV-2024-0042	"inv 2024 0042"
+plain_term	spec	Invoice	invoice
+folded_term	spec	Müller	muller

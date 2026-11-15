@@ -1,0 +1,18 @@
+# Word tokenizer after N1: split at non-alphanumeric characters, lowercase,
+# fold Latin diacritics (Tantivy LowerCaser + AsciiFoldingFilter). No stop words.
+# norm_version: 1
+# id	status	input	tokens
+basic	spec	Hello, World!	hello world
+fold_umlaut	spec	Müller	muller
+fold_accents	spec	naïve café	naive cafe
+no_transliteration	spec	Mueller	mueller
+sharp_s_via_n1	spec	Straße	strasse
+ligature_oe	spec	Œuvre	oeuvre
+address	spec	alice@example.com	alice example com
+identifier	spec	INV-2024-0042	inv 2024 0042
+url	spec	https://www.example.org/a_b	https www example org a b
+path	spec	file.tar.gz	file tar gz
+greek_lowercase	spec	Ελληνικά	ελληνικα
+short_number	spec	9810	9810
+stop_words_kept	spec	The and of	the and of
+invisible_inside_word	spec	pass\u{200B}word	password

@@ -1,0 +1,14 @@
+# Numbers: digit groups separated by space, -, ., / or parentheses that form
+# 6-15 digits in total are also written, concatenated, into the `numbers` field.
+# norm_version: 1
+# id	status	input	numbers_tokens
+phone_dashes	spec	555-123-4567	5551234567
+phone_parens	spec	(555) 123 4567	5551234567
+phone_dots	spec	555.123.4567	5551234567
+date_slashes	spec	2024/11/14	20241114
+in_sentence	spec	call 555 1234 now	5551234
+six_digits	spec	123456	123456
+fifteen_digits	spec	123456789012345	123456789012345
+five_digits	spec	12345	∅
+short	spec	9810	∅
+sixteen_digits	spec	1234567890123456	∅

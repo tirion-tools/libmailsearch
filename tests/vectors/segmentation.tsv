@@ -1,0 +1,14 @@
+# Script routing: runs of unsegmented scripts (Han, Hiragana, Katakana, Hangul,
+# Thai, Lao, Khmer, Myanmar) go to ng_* fields as overlapping bigrams, a lone character as a unigram;
+# everything else goes to the word fields.
+# norm_version: 1
+# id	status	input	word_tokens	ng_tokens
+han_pair	spec	会議	∅	会議
+han_triple	spec	会議室	∅	会議 議室
+han_single	spec	会	∅	会
+katakana	spec	カタカナ	∅	カタ タカ カナ
+hangul	spec	한국어	∅	한국 국어
+mixed_latin_han	spec	Project 会議 notes	project notes	会議
+han_then_digits	spec	会議2024	2024	会議
+two_runs	spec	会議 東京	∅	会議 東京
+han_hiragana_one_run	inferred	東京で会議	∅	東京 京で で会 会議

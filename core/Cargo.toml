@@ -1,0 +1,16 @@
+[package]
+name = "mailsearch-core"
+description = "Mail search rules shared by an index writer and the reader: normalisation, tokenizers, CJK bigrams, stemming, index layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tantivy.workspace = true
+rust-stemmers.workspace = true
+unicode-normalization.workspace = true

@@ -1,0 +1,26 @@
+# N1 normalisation: NFKC; strip Greek tonos and dialytika, Arabic harakat
+# (U+064B-U+065F, U+0670) and tatweel (U+0640), Hebrew points (U+0591-U+05C7); map ё->е and ß->ss;
+# drop invisible format characters and bidi controls. Case is preserved (lowercasing is the tokenizer's).
+# norm_version: 1
+# id	status	input	expected
+nfkc_fullwidth	spec	ＡＢＣ１２３	ABC123
+nfkc_ligature	spec	\u{FB01}le	file
+nfkc_superscript	spec	x\u{00B2}	x2
+nfkc_composes_decomposed	spec	Mu\u{0308}ller	Müller
+latin_diacritics_kept	spec	Müller	Müller
+greek_tonos	spec	\u{03AC}	\u{03B1}
+greek_tonos_word	spec	Αθήνα	Αθηνα
+greek_dialytika	spec	\u{03CA}	\u{03B9}
+greek_dialytika_tonos	spec	\u{03B0}	\u{03C5}
+arabic_harakat	spec	\u{0643}\u{064E}\u{062A}\u{064E}\u{0628}\u{064E}	\u{0643}\u{062A}\u{0628}
+arabic_tatweel	spec	\u{0643}\u{0640}\u{062A}\u{0640}\u{0627}\u{0628}	\u{0643}\u{062A}\u{0627}\u{0628}
+arabic_superscript_alef	spec	\u{0647}\u{0670}\u{0630}\u{0627}	\u{0647}\u{0630}\u{0627}
+hebrew_points	spec	\u{05E9}\u{05B8}\u{05C1}\u{05DC}\u{05D5}\u{05B9}\u{05DD}	\u{05E9}\u{05DC}\u{05D5}\u{05DD}
+cyrillic_yo	spec	ёлка	елка
+sharp_s	spec	Straße	Strasse
+zero_width_space	spec	pass\u{200B}word	password
+byte_order_mark	spec	\u{FEFF}hello	hello
+soft_hyphen	spec	ex\u{00AD}ample	example
+bidi_override	spec	\u{202E}gpj.exe\u{202C}	gpj.exe
+bidi_isolate	spec	\u{2066}abc\u{2069}	abc
+empty	spec	∅	∅
