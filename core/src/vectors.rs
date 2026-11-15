@@ -1,4 +1,4 @@
-//! Loader for the shared test vectors in `schema/vectors/` (format in `FORMAT.txt`).
+//! Loader for the shared test vectors in `tests/vectors/` (format in `FORMAT.txt`).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -165,7 +165,7 @@ fn actual(file: &str, input: &str) -> Vec<String> {
     }
 }
 
-/// Rule-by-rule parity of every vector file in `dir` (`schema/vectors`) with this crate, shared by
+/// Rule-by-rule parity of every vector file in `dir` (`tests/vectors`) with this crate, shared by
 /// the indexer's and the reader's tests. Checks the format, that every `.tsv` is covered, that each
 /// file describes [`crate::NORM_VERSION`], and every case (`spec` and `inferred`). Returns the
 /// number of cases checked, or every failure.
@@ -220,7 +220,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schema/vectors")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/vectors")
     }
 
     /// Rule-by-rule parity with every shared vector (also the format and version check).

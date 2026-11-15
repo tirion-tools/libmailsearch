@@ -291,7 +291,7 @@ fn last_error() -> String {
 
 #[test]
 fn shared_vectors() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schema/vectors");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/vectors");
     let n = mailsearch_core::vectors::check_all(&dir).unwrap_or_else(|e| panic!("{e}"));
     assert!(n > 0);
 }
@@ -343,14 +343,23 @@ fn null_and_bad_arguments() {
             count_capped: 0,
             flags: 0,
         };
-        assert_eq!(mailsearch_search(g, std::ptr::null(), &mut r), MAILSEARCH_E_ARG);
+        assert_eq!(
+            mailsearch_search(g, std::ptr::null(), &mut r),
+            MAILSEARCH_E_ARG
+        );
         assert_eq!(
             mailsearch_search(std::ptr::null_mut(), std::ptr::null(), &mut r),
             MAILSEARCH_E_ARG
         );
         let mut n = 0u64;
-        assert_eq!(mailsearch_num_docs(std::ptr::null_mut(), &mut n), MAILSEARCH_E_ARG);
-        assert_eq!(mailsearch_num_docs(g, std::ptr::null_mut()), MAILSEARCH_E_ARG);
+        assert_eq!(
+            mailsearch_num_docs(std::ptr::null_mut(), &mut n),
+            MAILSEARCH_E_ARG
+        );
+        assert_eq!(
+            mailsearch_num_docs(g, std::ptr::null_mut()),
+            MAILSEARCH_E_ARG
+        );
         assert_eq!(
             mailsearch_people(
                 g,
@@ -361,15 +370,24 @@ fn null_and_bad_arguments() {
             ),
             MAILSEARCH_E_ARG
         );
-        assert_eq!(mailsearch_set_excluded(g, std::ptr::null(), 3), MAILSEARCH_E_ARG);
+        assert_eq!(
+            mailsearch_set_excluded(g, std::ptr::null(), 3),
+            MAILSEARCH_E_ARG
+        );
         assert_eq!(
             mailsearch_set_owner(g, std::ptr::null(), std::ptr::null(), 1),
             MAILSEARCH_E_ARG
         );
         let (mut d, mut lease_gen) = (0u32, 0u64);
-        assert_eq!(mailsearch_reload(g, std::ptr::null_mut(), &mut lease_gen), MAILSEARCH_E_ARG);
+        assert_eq!(
+            mailsearch_reload(g, std::ptr::null_mut(), &mut lease_gen),
+            MAILSEARCH_E_ARG
+        );
         assert_eq!(mailsearch_reload(g, &mut d, &mut lease_gen), MAILSEARCH_OK);
-        assert_eq!(mailsearch_release(g, std::ptr::null_mut()), MAILSEARCH_E_ARG);
+        assert_eq!(
+            mailsearch_release(g, std::ptr::null_mut()),
+            MAILSEARCH_E_ARG
+        );
         assert_eq!(mailsearch_cancel(std::ptr::null_mut()), MAILSEARCH_E_ARG);
         assert_eq!(mailsearch_close(std::ptr::null_mut()), MAILSEARCH_E_ARG);
         // bad flags, mode, fields, n_top, invalid UTF-8, too small capacity
@@ -402,7 +420,10 @@ fn null_and_bad_arguments() {
         assert_eq!(search(g, &[invalid], q5()).rc, MAILSEARCH_E_ARG);
         // no clauses: nothing matches
         let o = search(g, &[], q5());
-        assert_eq!((o.rc, o.count, o.top.len(), o.list.len()), (MAILSEARCH_OK, 0, 0, 0));
+        assert_eq!(
+            (o.rc, o.count, o.top.len(), o.list.len()),
+            (MAILSEARCH_OK, 0, 0, 0)
+        );
         close(g);
     }
 }
@@ -454,7 +475,10 @@ fn excluded_set() {
     let g = open(&fx.root).unwrap();
     let ex = [2u64, 15];
     // SAFETY: valid array.
-    assert_eq!(unsafe { mailsearch_set_excluded(g, ex.as_ptr(), ex.len()) }, MAILSEARCH_OK);
+    assert_eq!(
+        unsafe { mailsearch_set_excluded(g, ex.as_ptr(), ex.len()) },
+        MAILSEARCH_OK
+    );
     let o = search(g, &[c("invoice")], q5());
     assert_eq!((mids(&o.list), o.count), (vec![1], 1));
     assert_eq!(mids(&o.top), vec![1]);
@@ -468,7 +492,10 @@ fn excluded_set() {
     );
     assert_eq!(o.count, 3);
     // SAFETY: empty set.
-    assert_eq!(unsafe { mailsearch_set_excluded(g, std::ptr::null(), 0) }, MAILSEARCH_OK);
+    assert_eq!(
+        unsafe { mailsearch_set_excluded(g, std::ptr::null(), 0) },
+        MAILSEARCH_OK
+    );
     assert_eq!(search(g, &[c("invoice")], q5()).count, 3);
     close(g);
 }

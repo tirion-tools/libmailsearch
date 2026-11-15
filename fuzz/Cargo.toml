@@ -1,0 +1,25 @@
+# cargo-fuzz harness: the reader on corrupted index files. Run:
+#   RUSTC_BOOTSTRAP=1 cargo fuzz run --fuzz-dir fuzz reader_index
+[package]
+name = "mailsearch-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+mailsearch-core = { path = "../core" }
+mailsearch = { path = "../reader" }
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "lz4-compression", "stemmer"] }
+
+[[bin]]
+name = "reader_index"
+path = "fuzz_targets/reader_index.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

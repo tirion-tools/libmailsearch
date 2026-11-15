@@ -166,7 +166,7 @@ pub fn link_hosts_into(out: &mut String, text: &str) {
 
 /// Digit groups separated by one of ` -./()` (or `) `) forming 6–15 digits in total, concatenated,
 /// space separated (the `numbers` field). A single run of 6–15 digits is written too
-/// (`schema/vectors/numbers.tsv` `six_digits`, `fifteen_digits`); a run preceded by a letter or
+/// (`tests/vectors/numbers.tsv` `six_digits`, `fifteen_digits`); a run preceded by a letter or
 /// digit is not the start of a group.
 pub fn number_groups(text: &str) -> String {
     let b = text.as_bytes();

@@ -157,7 +157,7 @@ pub enum QueryToken {
 }
 
 impl std::fmt::Display for QueryToken {
-    /// `term` or `"a b c"` (the notation of `schema/vectors/query.tsv`).
+    /// `term` or `"a b c"` (the notation of `tests/vectors/query.tsv`).
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             QueryToken::Term(t) => f.write_str(t),

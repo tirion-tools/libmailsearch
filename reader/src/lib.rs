@@ -299,7 +299,10 @@ fn open_err(e: OpenError) -> i32 {
 /// # Safety
 /// `norm_version` and `layout_version` must be null or valid for one `u32` write.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mailsearch_versions(norm_version: *mut u32, layout_version: *mut u32) -> i32 {
+pub unsafe extern "C" fn mailsearch_versions(
+    norm_version: *mut u32,
+    layout_version: *mut u32,
+) -> i32 {
     guard(|| {
         if norm_version.is_null() || layout_version.is_null() {
             return arg("null argument");
@@ -386,7 +389,11 @@ pub unsafe extern "C" fn mailsearch_set_owner(
 /// # Safety
 /// `mids` must be valid for `n` elements.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mailsearch_set_excluded(g: *mut MailsearchHandle, mids: *const u64, n: usize) -> i32 {
+pub unsafe extern "C" fn mailsearch_set_excluded(
+    g: *mut MailsearchHandle,
+    mids: *const u64,
+    n: usize,
+) -> i32 {
     with(g, |h| {
         // SAFETY: caller contract.
         let Some(m) = (unsafe { slice(mids, n) }) else {
@@ -422,7 +429,11 @@ fn put_hits(dst: *mut MailsearchHit, cap: usize, src: &[engine::Hit]) -> usize {
 /// # Safety
 /// `q` and `r` must be valid; `r.top`/`r.list` valid for `top_cap`/`list_cap` elements.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mailsearch_search(g: *mut MailsearchHandle, q: *const MailsearchQuery, r: *mut MailsearchResult) -> i32 {
+pub unsafe extern "C" fn mailsearch_search(
+    g: *mut MailsearchHandle,
+    q: *const MailsearchQuery,
+    r: *mut MailsearchResult,
+) -> i32 {
     with(g, |h| {
         // SAFETY: caller contract.
         let (Some(q), Some(r)) = (unsafe { q.as_ref() }, unsafe { r.as_mut() }) else {
@@ -461,7 +472,11 @@ pub unsafe extern "C" fn mailsearch_search(g: *mut MailsearchHandle, q: *const M
             MAILSEARCH_R_FROM_RECENT
         } else {
             0
-        } | if hits.corrected { MAILSEARCH_R_CORRECTED } else { 0 };
+        } | if hits.corrected {
+            MAILSEARCH_R_CORRECTED
+        } else {
+            0
+        };
         MAILSEARCH_OK
     })
 }
@@ -569,7 +584,11 @@ pub unsafe extern "C" fn mailsearch_highlight(
 /// # Safety
 /// `dir` and `gen` must be valid for one write each.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mailsearch_reload(g: *mut MailsearchHandle, dir: *mut u32, generation: *mut u64) -> i32 {
+pub unsafe extern "C" fn mailsearch_reload(
+    g: *mut MailsearchHandle,
+    dir: *mut u32,
+    generation: *mut u64,
+) -> i32 {
     with(g, |h| {
         if dir.is_null() || generation.is_null() {
             return arg("null dir/gen");
@@ -670,7 +689,10 @@ mod tests {
         // SAFETY: valid stack pointers / nulls.
         unsafe {
             assert_eq!(mailsearch_versions(&mut n, &mut l), MAILSEARCH_OK);
-            assert_eq!(mailsearch_versions(std::ptr::null_mut(), &mut l), MAILSEARCH_E_ARG);
+            assert_eq!(
+                mailsearch_versions(std::ptr::null_mut(), &mut l),
+                MAILSEARCH_E_ARG
+            );
         }
         assert_eq!(
             (n, l),

@@ -1,0 +1,36 @@
+# libmailsearch: the search rules (mailsearch-core) and the reader with its C ABI (mailsearch,
+# cdylib libmailsearch.so). The C++ query language is in cpp/ (CMake); the fuzz harness in fuzz/.
+[workspace]
+resolver = "3"
+members = ["core", "reader"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+mailsearch-core = { path = "core" }
+# The exact Tantivy version is part of the index VERSION stamp (core/src/lib.rs); consumers keep `=`.
+tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "lz4-compression", "stemmer"] }
+rust-stemmers = "1.2"
+unicode-normalization = "0.1"
+memmap2 = "0.9"
+stable_deref_trait = "1"
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+
+# The C ABI catches every unwind (reader/src/lib.rs), which needs panic = "unwind": build the
+# shared library with `--profile ffi`. Consumers that build it need the same profile.
+[profile.ffi]
+inherits = "release"
+panic = "unwind"

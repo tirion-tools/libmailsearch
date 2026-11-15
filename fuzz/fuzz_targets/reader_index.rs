@@ -6,9 +6,9 @@
 //! sanitizer report is a finding.
 #![no_main]
 
+use libfuzzer_sys::fuzz_target;
 use mailsearch::*;
 use mailsearch_core::{DocInput, Fields, register, schema, stamp, to_tantivy};
-use libfuzzer_sys::fuzz_target;
 use std::ffi::c_char;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
