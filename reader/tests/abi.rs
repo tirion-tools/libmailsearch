@@ -183,6 +183,7 @@ struct C {
     mode: u32,
     flags: u32,
     group: u32,
+    near: u32,
 }
 
 fn c(text: &str) -> C {
@@ -192,6 +193,7 @@ fn c(text: &str) -> C {
         mode: 0,
         flags: 0,
         group: 0,
+        near: 0,
     }
 }
 
@@ -228,6 +230,7 @@ fn search(g: *mut MailsearchHandle, cls: &[C], q: Q) -> Out {
             mode: c.mode,
             flags: c.flags,
             group: c.group,
+            near: c.near,
         })
         .collect();
     let gq = MailsearchQuery {
@@ -694,6 +697,18 @@ fn groups_negation_phrases_and_stems() {
     let mut p = c("the pay invoice");
     p.mode = 2;
     assert!(search(g, &[p], q5()).list.is_empty());
+    // AROUND (MAILSEARCH_M_NEAR): "Please pay the invoice" has two words between "please" and "invoice"
+    let near = |text: &str, n: u32| {
+        let mut p = c(text);
+        p.mode = 4;
+        p.near = n;
+        mids(&search(g, &[p], q5()).list)
+    };
+    assert_eq!(near("please invoice", 2), vec![1]);
+    assert_eq!(near("invoice please", 2), vec![1], "either order");
+    assert!(near("please invoice", 1).is_empty());
+    assert!(near("pleas invoice", 5).is_empty(), "exact tokens only");
+    assert_eq!(near("invoice", 0), vec![15, 2, 1], "one word: that word");
     // identifier → phrase of parts
     assert_eq!(
         mids(&search(g, &[c("alice@example.com")], q5()).list),
@@ -764,6 +779,7 @@ fn highlight_spans() {
                 mode: c.mode,
                 flags: c.flags,
                 group: c.group,
+                near: c.near,
             })
             .collect();
         let q = MailsearchQuery {
@@ -821,6 +837,16 @@ fn highlight_spans() {
         &t[s[0].start as usize..s[0].end as usize],
         "alice@example.com"
     );
+    // AROUND highlights each word where it occurs
+    let mut p = c("please invoice");
+    p.mode = 4;
+    p.near = 2;
+    let t = "Please pay the invoice";
+    let got: Vec<&str> = hl(&[p], t)
+        .iter()
+        .map(|x| &t[x.start as usize..x.end as usize])
+        .collect();
+    assert_eq!(got, vec!["Please", "invoice"]);
     close(g);
 }
 

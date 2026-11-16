@@ -114,6 +114,7 @@ fn clause(text: &str, flags: u32) -> MailsearchClause {
         mode: M_DEFAULT,
         flags,
         group: 0,
+        near: 0,
     }
 }
 

@@ -54,6 +54,7 @@ enum {
   MAILSEARCH_M_EXACT = 1,   /* `+word`: exact token only */
   MAILSEARCH_M_PHRASE = 2,  /* "a b": exact tokens in order, no prefix/stem/typo */
   MAILSEARCH_M_PREFIX = 3,  /* `word*`: explicit prefix */
+  MAILSEARCH_M_NEAR = 4,    /* `a AROUND n b`: the word tokens of `text` at most `near` tokens apart, either order */
 };
 
 /* Clause flags. */
@@ -69,6 +70,7 @@ typedef struct MailsearchClause {
   uint32_t mode;    /* MAILSEARCH_M_* */
   uint32_t flags;   /* MAILSEARCH_C_* */
   uint32_t group;   /* 0: its own AND-ed clause; equal non-zero groups are OR-ed, the group AND-ed */
+  uint32_t near;    /* MAILSEARCH_M_NEAR: the most tokens between the words; ignored by the other modes */
 } MailsearchClause;
 
 /* Query flags. */

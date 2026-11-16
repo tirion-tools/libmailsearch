@@ -55,6 +55,7 @@ pub struct MailsearchClause {
     pub mode: u32,
     pub flags: u32,
     pub group: u32,
+    pub near: u32,
 }
 
 #[repr(C)]
@@ -241,6 +242,7 @@ unsafe fn to_query(q: &MailsearchQuery, n_list: usize) -> Result<Query, i32> {
             1 => Mode::Exact,
             2 => Mode::Phrase,
             3 => Mode::Prefix,
+            4 => Mode::Near(c.near),
             _ => return Err(arg("bad clause mode")),
         };
         // SAFETY: caller contract.

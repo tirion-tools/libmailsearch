@@ -110,6 +110,8 @@ pub enum Mode {
     Phrase,
     /// `word*`: explicit prefix
     Prefix,
+    /// `a AROUND n b`: the clause's word tokens at most n tokens apart, in either order (exact tokens)
+    Near(u32),
 }
 
 /// One clause of the caller's query compiler (`MailsearchClause`).
@@ -610,6 +612,11 @@ enum TK {
         parts: Vec<String>,
         last_prefix: bool,
     },
+    /// `Mode::Near`: the parts at most `slop` tokens apart, in either order
+    Near {
+        parts: Vec<String>,
+        slop: u32,
+    },
     Cjk {
         bigrams: Vec<String>,
     },
@@ -1092,14 +1099,24 @@ impl Engine {
             match word {
                 None => {}
                 Some(QueryToken::Phrase(parts)) => {
-                    let last_prefix = match cl.mode {
-                        Mode::Prefix => true,
-                        Mode::Default => cl.partial && !cl.negate,
-                        Mode::Exact | Mode::Phrase => false,
+                    let tk = match cl.mode {
+                        Mode::Near(slop) => TK::Near { parts, slop },
+                        Mode::Prefix => TK::Phrase {
+                            parts,
+                            last_prefix: true,
+                        },
+                        Mode::Default => TK::Phrase {
+                            parts,
+                            last_prefix: cl.partial && !cl.negate,
+                        },
+                        Mode::Exact | Mode::Phrase => TK::Phrase {
+                            parts,
+                            last_prefix: false,
+                        },
                     };
                     terms.push(T {
                         fields,
-                        tk: TK::Phrase { parts, last_prefix },
+                        tk,
                         partial: cl.partial,
                     });
                 }
@@ -1113,7 +1130,7 @@ impl Engine {
                     } else {
                         let prefix = match cl.mode {
                             Mode::Prefix => true,
-                            Mode::Exact | Mode::Phrase => false,
+                            Mode::Exact | Mode::Phrase | Mode::Near(_) => false,
                             Mode::Default => !cl.negate && n >= 2 && (!q.typing || cl.partial),
                         };
                         let short = q.typing
@@ -1374,6 +1391,23 @@ impl Engine {
                             Box::new(PhraseQuery::new(terms))
                         };
                         subs.push(boost(q, o.colw.of(name)));
+                    }
+                }
+            }
+            TK::Near { parts, slop } => {
+                if tiers.exact {
+                    // Tantivy's slop is order-preserving (a transposition costs 2): one phrase per order
+                    for (f, name) in self.word_fields(t.fields, sel) {
+                        for rev in [false, true] {
+                            let mut terms: Vec<Term> =
+                                parts.iter().map(|p| Term::from_field_text(f, p)).collect();
+                            if rev {
+                                terms.reverse();
+                            }
+                            let mut q = PhraseQuery::new(terms);
+                            q.set_slop(*slop);
+                            subs.push(boost(Box::new(q), o.colw.of(name)));
+                        }
                     }
                 }
             }
@@ -2479,7 +2513,7 @@ impl Engine {
             }
             let text = match &t.tk {
                 TK::Tiers { t, .. } => t.clone(),
-                TK::Phrase { parts, .. } => parts.join(" "),
+                TK::Phrase { parts, .. } | TK::Near { parts, .. } => parts.join(" "),
                 TK::Cjk { bigrams } => bigrams.join(" "),
             };
             terms.push(OracleTerm {
@@ -2673,22 +2707,31 @@ fn cls_view(cls: &[CClause]) -> Vec<HlTerm<'_>> {
     cls.iter()
         .filter(|c| !c.negate)
         .flat_map(|c| c.terms.iter())
-        .map(|t| match &t.tk {
+        .flat_map(|t| match &t.tk {
             TK::Tiers {
                 t: w,
                 prefix,
                 expand,
                 ..
-            } => HlTerm::Word {
+            } => vec![HlTerm::Word {
                 t: w,
                 prefix: *prefix,
                 stem: *expand && !t.partial && eligible(w),
-            },
-            TK::Phrase { parts, last_prefix } => HlTerm::Phrase {
+            }],
+            TK::Phrase { parts, last_prefix } => vec![HlTerm::Phrase {
                 parts,
                 last_prefix: *last_prefix,
-            },
-            TK::Cjk { bigrams } => HlTerm::Cjk { bigrams },
+            }],
+            // AROUND: each word where it occurs (the words need not be adjacent)
+            TK::Near { parts, .. } => parts
+                .iter()
+                .map(|p| HlTerm::Word {
+                    t: p,
+                    prefix: false,
+                    stem: false,
+                })
+                .collect(),
+            TK::Cjk { bigrams } => vec![HlTerm::Cjk { bigrams }],
         })
         .collect()
 }

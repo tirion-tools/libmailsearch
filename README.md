@@ -64,8 +64,8 @@ Related projects:
 - **Reader** (C ABI, `mailsearch.h`): `mailsearch_versions`, `mailsearch_open`, `mailsearch_set_owner`,
   `mailsearch_set_excluded`, `mailsearch_search`, `mailsearch_cancel`, `mailsearch_people`, `mailsearch_highlight`,
   `mailsearch_reload` / `mailsearch_release` (reader lease), `mailsearch_num_docs`, `mailsearch_close`,
-  `mailsearch_last_error`. Queries are typed clause lists (`MailsearchQuery`); no query string is parsed in Rust. The
-  Rust API is `mailsearch::engine::Engine`.
+  `mailsearch_last_error`. Queries are typed clause lists (`MailsearchQuery`; clause modes default, exact, phrase, prefix
+  and proximity `MAILSEARCH_M_NEAR`); no query string is parsed in Rust. The Rust API is `mailsearch::engine::Engine`.
 - **Query language** (C++, namespace `mailsearch`): `parse_query`, `canonical_text`, `same_query`, `remove_chip`,
   `describe_node`, `keyword_completions`, `is_keyword`, and the date helpers in `query_dates.h`. Compiling the AST into
   reader clauses and into the caller's own filters is the caller's job.
