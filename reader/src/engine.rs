@@ -1748,8 +1748,16 @@ impl Engine {
     }
 
     /// Person documents matching `q` (correspondents.id), best first: by affinity then message
-    /// count (`by_affinity`, suggestions) or by message count (people-first).
-    fn people_match(&self, q: Box<dyn TQuery>, aff: &Aff, by_affinity: bool) -> SResult<Vec<u64>> {
+    /// count (`by_affinity`, suggestions) or by message count (people-first); the best `limit` only when
+    /// given. A short prefix matches nearly every person (`c`: every `.com` address), so each key is looked
+    /// up once and only the best `limit` are sorted.
+    fn people_match(
+        &self,
+        q: Box<dyn TQuery>,
+        aff: &Aff,
+        by_affinity: bool,
+        limit: Option<usize>,
+    ) -> SResult<Vec<u64>> {
         let Some(p) = &self.people else {
             return Ok(Vec::new());
         };
@@ -1779,17 +1787,26 @@ impl Engine {
                 d = sc.advance();
             }
         }
-        let key = |id: &u64| {
-            let (_, a, n) = aff.by_id.get(id).copied().unwrap_or((0, 0.0, 0));
-            (if by_affinity { a } else { 0.0 }, n)
-        };
-        ids.sort_by(|x, y| {
-            let (ax, nx) = key(x);
-            let (ay, ny) = key(y);
-            ay.total_cmp(&ax).then(ny.cmp(&nx)).then(x.cmp(y))
-        });
+        ids.sort_unstable();
         ids.dedup();
-        Ok(ids)
+        let mut v: Vec<(f64, u64, u64)> = ids
+            .into_iter()
+            .map(|id| {
+                let (_, a, n) = aff.by_id.get(&id).copied().unwrap_or((0, 0.0, 0));
+                (if by_affinity { a } else { 0.0 }, n, id)
+            })
+            .collect();
+        let best = |x: &(f64, u64, u64), y: &(f64, u64, u64)| {
+            y.0.total_cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2))
+        };
+        if let Some(k) = limit
+            && k < v.len()
+        {
+            v.select_nth_unstable_by(k, best);
+            v.truncate(k);
+        }
+        v.sort_unstable_by(best);
+        Ok(v.into_iter().map(|x| x.2).collect())
     }
 
     /// People-first resolution of one word: exact name token, else prefix (≥ 3), else fuzzy (≥ 4,
@@ -1814,6 +1831,7 @@ impl Engine {
                 Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic)),
                 aff,
                 false,
+                None,
             )?;
             if !v.is_empty() {
                 return Ok((addrs(v), 1));
@@ -1824,6 +1842,7 @@ impl Engine {
                 Box::new(FuzzyTermQuery::new_prefix(term.clone(), 0, false)),
                 aff,
                 false,
+                None,
             )?;
             if !v.is_empty() {
                 return Ok((addrs(v), 2));
@@ -1831,7 +1850,12 @@ impl Engine {
         }
         if n >= 4 && !partial {
             let d = if n >= 8 { 2 } else { 1 };
-            let v = self.people_match(Box::new(FuzzyTermQuery::new(term, d, true)), aff, false)?;
+            let v = self.people_match(
+                Box::new(FuzzyTermQuery::new(term, d, true)),
+                aff,
+                false,
+                None,
+            )?;
             if !v.is_empty() {
                 return Ok((addrs(v), 3));
             }
@@ -1866,9 +1890,7 @@ impl Engine {
             })
             .collect();
         let aff = self.affinity();
-        let mut v = self.people_match(Box::new(BooleanQuery::new(subs)), &aff, true)?;
-        v.truncate(cap);
-        Ok(v)
+        self.people_match(Box::new(BooleanQuery::new(subs)), &aff, true, Some(cap))
     }
 
     // ---- quoted-text fallback ----
