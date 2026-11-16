@@ -62,6 +62,9 @@ use tantivy::{
 pub const ZONE: u32 = 512;
 /// Cancellation is checked every this many documents a scorer visits (and between segments).
 pub const CANCEL_EVERY: u32 = 4096;
+/// People-first resolution sorts only this many of the matching people before taking the top 5
+/// distinct sender addresses (all of them when these share fewer than 5 addresses).
+const PEOPLE_FIRST_SCAN: usize = 64;
 
 // MAILSEARCH_F_* (clause fields) and MAILSEARCH_T_* (tiers), as in mailsearch.h.
 pub const F_SUBJECT: u32 = 1 << 0;
@@ -836,9 +839,45 @@ struct Aff {
     a: HashMap<u64, f64>,
     /// the 50 correspondents the user sent most to (address hashes)
     top50: Arc<HashSet<u64>>,
-    /// correspondents.id → (address hash, A, message count)
-    by_id: HashMap<u64, (u64, f64, u64)>,
+    /// per people segment, per document: the Person's address hash, A and message count (zero for
+    /// Corr documents)
+    keys: HashMap<SegmentId, Vec<PKey>>,
 }
+
+#[derive(Clone, Copy, Default)]
+struct PKey {
+    addr: u64,
+    a: f64,
+    n: u64,
+}
+
+/// A person match in rank order: `Less` is better (higher A, then more messages, then lower id).
+#[derive(Clone, Copy)]
+struct PRank {
+    a: f64,
+    n: u64,
+    id: u64,
+    addr: u64,
+}
+
+impl Ord for PRank {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.a.total_cmp(&self.a)
+            .then(o.n.cmp(&self.n))
+            .then(self.id.cmp(&o.id))
+    }
+}
+impl PartialOrd for PRank {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl PartialEq for PRank {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o).is_eq()
+    }
+}
+impl Eq for PRank {}
 
 fn affinity_of(sent: u64, replied: u64, contact: bool) -> f64 {
     let mut a = ((1.0 + sent as f64).ln() / 51f64.ln()).min(1.0);
@@ -849,6 +888,119 @@ fn affinity_of(sent: u64, replied: u64, contact: bool) -> f64 {
         a = 1.0;
     }
     a
+}
+
+/// One people segment's rows, read once from its fast fields; deletes apply when they are joined.
+#[derive(Default)]
+struct SegPeople {
+    /// Person documents: (doc, correspondents.id, address hash, account)
+    persons: Vec<(DocId, u64, u64, u64)>,
+    /// Corr documents: (doc, correspondents.id, sent, replied, message count, contact)
+    corr: Vec<(DocId, u64, u64, u64, u64, bool)>,
+}
+
+impl SegPeople {
+    /// Reads the columns in blocks: one virtual call per block and column, not per document.
+    fn read(seg: &tantivy::SegmentReader) -> SegPeople {
+        let mut out = SegPeople::default();
+        let names = [
+            "kind",
+            "account",
+            "id",
+            "addr_h",
+            "sent_to",
+            "replied_to",
+            "received_from",
+            "cc_with",
+            "is_contact",
+        ];
+        let Ok(cols) = names
+            .iter()
+            .map(|n| col(seg, n))
+            .collect::<tantivy::Result<Vec<_>>>()
+        else {
+            return out;
+        };
+        const B: u32 = 4096;
+        let mut buf = vec![vec![0u64; B as usize]; names.len()];
+        let max = seg.max_doc();
+        let mut d0 = 0u32;
+        while d0 < max {
+            let k = (max - d0).min(B) as usize;
+            for (c, b) in cols.iter().zip(buf.iter_mut()) {
+                c.get_range(d0 as u64, &mut b[..k]);
+            }
+            let [kind, account, id, ah, sent, rep, recv, cc, contact] = &buf[..] else {
+                unreachable!("one buffer per column")
+            };
+            for (j, &kd) in kind[..k].iter().enumerate() {
+                let d = d0 + j as u32;
+                if kd == 0 {
+                    out.persons.push((d, id[j], ah[j], account[j]));
+                } else {
+                    let n = sent[j] + recv[j] + cc[j];
+                    out.corr
+                        .push((d, id[j], sent[j], rep[j], n, contact[j] != 0));
+                }
+            }
+            d0 += k as u32;
+        }
+        out
+    }
+}
+
+impl Aff {
+    /// Joins the live Person and Corr rows of every segment of `s` (`rows` in segment order) by
+    /// correspondents.id; A only for the Person rows of the `scope` accounts (`None`: every account).
+    fn build(s: &Searcher, rows: &[SegPeople], scope: Option<&[u64]>) -> Aff {
+        let mut aff = Aff::default();
+        let segs = s.segment_readers();
+        // Corr rows (id → sent, replied, message count, contact), sorted by id
+        let mut corr: Vec<(u64, u64, u64, u64, bool)> = Vec::new();
+        for (seg, r) in segs.iter().zip(rows) {
+            let alive = seg.alive_bitset();
+            corr.extend(
+                r.corr
+                    .iter()
+                    .filter(|c| alive.is_none_or(|a| a.is_alive(c.0)))
+                    .map(|c| (c.1, c.2, c.3, c.4, c.5)),
+            );
+        }
+        corr.sort_unstable_by_key(|c| c.0);
+        let mut top: Vec<(u64, u64)> = Vec::new();
+        for (seg, r) in segs.iter().zip(rows) {
+            let alive = seg.alive_bitset();
+            let mut keys = vec![PKey::default(); seg.max_doc() as usize];
+            for &(d, id, ah, account) in &r.persons {
+                if !alive.is_none_or(|a| a.is_alive(d)) {
+                    continue;
+                }
+                let (sent, rep, n, contact) = match corr.binary_search_by_key(&id, |c| c.0) {
+                    Ok(k) => (corr[k].1, corr[k].2, corr[k].3, corr[k].4),
+                    Err(_) => (0, 0, 0, false),
+                };
+                // outside the affinity accounts: suggestions and people-first only (A = 0)
+                let a = if scope.is_none_or(|v| v.binary_search(&account).is_ok()) {
+                    let a = affinity_of(sent, rep, contact);
+                    let e = aff.a.entry(ah).or_insert(0.0);
+                    *e = e.max(a);
+                    if sent > 0 {
+                        top.push((ah, sent));
+                    }
+                    a
+                } else {
+                    0.0
+                };
+                keys[d as usize] = PKey { addr: ah, a, n };
+            }
+            aff.keys.insert(seg.segment_id(), keys);
+        }
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut seen = HashSet::new();
+        top.retain(|x| seen.insert(x.0));
+        aff.top50 = Arc::new(top.iter().take(50).map(|x| x.0).collect());
+        aff
+    }
 }
 
 // ---- engine -------------------------------------------------------------------------------------
@@ -1692,85 +1844,32 @@ impl Engine {
         if let Some(a) = self.aff.get(&self.aff_accounts) {
             return a.clone();
         }
-        let mut aff = Aff::default();
-        if let Some(p) = &self.people {
-            let s = p.side.reader.searcher();
-            let mut addr: HashMap<u64, (u64, bool)> = HashMap::new(); // id → addr_h, in scope
-            let mut corr: HashMap<u64, (u64, u64, u64, bool)> = HashMap::new(); // id → sent, replied, n, contact
-            for seg in s.segment_readers() {
-                let cols = (|| -> tantivy::Result<_> {
-                    Ok((
-                        col(seg, "kind")?,
-                        col(seg, "account")?,
-                        col(seg, "id")?,
-                        col(seg, "addr_h")?,
-                        col(seg, "sent_to")?,
-                        col(seg, "replied_to")?,
-                        col(seg, "received_from")?,
-                        col(seg, "cc_with")?,
-                        col(seg, "is_contact")?,
-                    ))
-                })();
-                let Ok((kind, account, id, ah, sent, rep, recv, cc, contact)) = cols else {
-                    continue;
-                };
-                for d in 0..seg.max_doc() {
-                    if seg.is_deleted(d) {
-                        continue;
-                    }
-                    let i = id.get_val(d);
-                    if kind.get_val(d) == 0 {
-                        let scope = self
-                            .aff_accounts
-                            .as_ref()
-                            .is_none_or(|v| v.binary_search(&account.get_val(d)).is_ok());
-                        addr.insert(i, (ah.get_val(d), scope));
-                    } else {
-                        let n = sent.get_val(d) + recv.get_val(d) + cc.get_val(d);
-                        corr.insert(
-                            i,
-                            (sent.get_val(d), rep.get_val(d), n, contact.get_val(d) != 0),
-                        );
-                    }
-                }
+        let aff = match &self.people {
+            Some(p) => {
+                let s = p.side.reader.searcher();
+                let rows: Vec<SegPeople> =
+                    s.segment_readers().iter().map(SegPeople::read).collect();
+                Aff::build(&s, &rows, self.aff_accounts.as_deref())
             }
-            let mut top: Vec<(u64, u64)> = Vec::new();
-            for (id, (ah, scope)) in &addr {
-                let (sent, rep, n, contact) = corr.get(id).copied().unwrap_or_default();
-                if !scope {
-                    // outside the affinity accounts: suggestions and people-first only
-                    aff.by_id.insert(*id, (*ah, 0.0, n));
-                    continue;
-                }
-                let a = affinity_of(sent, rep, contact);
-                let e = aff.a.entry(*ah).or_insert(0.0);
-                *e = e.max(a);
-                aff.by_id.insert(*id, (*ah, a, n));
-                if sent > 0 {
-                    top.push((*ah, sent));
-                }
-            }
-            top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let mut seen = HashSet::new();
-            top.retain(|x| seen.insert(x.0));
-            aff.top50 = Arc::new(top.iter().take(50).map(|x| x.0).collect());
-        }
+            None => Aff::default(),
+        };
         let a = Arc::new(aff);
         self.aff.insert(self.aff_accounts.clone(), a.clone());
         a
     }
 
-    /// Person documents matching `q` (correspondents.id), best first: by affinity then message
-    /// count (`by_affinity`, suggestions) or by message count (people-first); the best `limit` only when
-    /// given. A short prefix matches nearly every person (`c`: every `.com` address), so each key is looked
-    /// up once and only the best `limit` are sorted.
+    /// Person documents matching `q`, best first, as (correspondents.id, address hash): by affinity then
+    /// message count (`by_affinity`, suggestions) or by message count (people-first), then id; the best
+    /// `limit` only when given. A short prefix matches nearly every person (`c`: every `.com` address), so
+    /// each match reads its key from the per-document table and only the best `limit` are kept (a bounded
+    /// heap). Person ids are unique among live documents (the indexer upserts by id).
     fn people_match(
         &self,
         q: Box<dyn TQuery>,
         aff: &Aff,
         by_affinity: bool,
         limit: Option<usize>,
-    ) -> SResult<Vec<u64>> {
+    ) -> SResult<Vec<(u64, u64)>> {
         let Some(p) = &self.people else {
             return Ok(Vec::new());
         };
@@ -1786,40 +1885,44 @@ impl Engine {
             ),
         ]);
         let w = q.weight(EnableScoring::disabled_from_searcher(&s))?;
-        let mut ids: Vec<u64> = Vec::new();
+        // max-heap on "worse": the root is the worst kept match
+        let mut heap: BinaryHeap<PRank> = BinaryHeap::new();
+        let cap = limit.unwrap_or(usize::MAX);
+        if cap == 0 {
+            return Ok(Vec::new());
+        }
+        let none: Vec<PKey> = Vec::new();
         for seg in s.segment_readers() {
             self.check_cancel()?;
             let id = col(seg, "id")?;
+            let keys = aff.keys.get(&seg.segment_id()).unwrap_or(&none);
             let alive = seg.alive_bitset();
             let mut sc = w.scorer(seg, 1.0)?;
             let mut d = sc.doc();
             while d != TERMINATED {
                 if alive.is_none_or(|a| a.is_alive(d)) {
-                    ids.push(id.get_val(d));
+                    let k = keys.get(d as usize).copied().unwrap_or_default();
+                    let r = PRank {
+                        a: if by_affinity { k.a } else { 0.0 },
+                        n: k.n,
+                        id: id.get_val(d),
+                        addr: k.addr,
+                    };
+                    if heap.len() < cap {
+                        heap.push(r);
+                    } else if heap.peek().is_some_and(|w| r < *w) {
+                        heap.pop();
+                        heap.push(r);
+                    }
                 }
                 d = sc.advance();
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
-        let mut v: Vec<(f64, u64, u64)> = ids
+        Ok(heap
+            .into_sorted_vec()
             .into_iter()
-            .map(|id| {
-                let (_, a, n) = aff.by_id.get(&id).copied().unwrap_or((0, 0.0, 0));
-                (if by_affinity { a } else { 0.0 }, n, id)
-            })
-            .collect();
-        let best = |x: &(f64, u64, u64), y: &(f64, u64, u64)| {
-            y.0.total_cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2))
-        };
-        if let Some(k) = limit
-            && k < v.len()
-        {
-            v.select_nth_unstable_by(k, best);
-            v.truncate(k);
-        }
-        v.sort_unstable_by(best);
-        Ok(v.into_iter().map(|x| x.2).collect())
+            .map(|r| (r.id, r.addr))
+            .collect())
     }
 
     /// People-first resolution of one word: exact name token, else prefix (≥ 3), else fuzzy (≥ 4,
@@ -1830,47 +1933,45 @@ impl Engine {
         };
         let term = Term::from_field_text(p.f.names, t);
         let n = t.chars().count();
-        // the top 5 distinct sender addresses
-        let addrs = |ids: Vec<u64>| -> Vec<u64> {
-            let mut seen = HashSet::new();
-            ids.iter()
-                .filter_map(|i| aff.by_id.get(i).map(|x| x.0))
-                .filter(|a| seen.insert(*a))
-                .take(5)
-                .collect()
+        // the top 5 distinct sender addresses of the matching people (None: no person matched);
+        // ids sharing an address (one person in several accounts) can fill the best
+        // PEOPLE_FIRST_SCAN, and only then are all matches sorted
+        let top = |q: &dyn Fn() -> Box<dyn TQuery>| -> SResult<Option<Vec<u64>>> {
+            // an address hash of 0 is a person the affinity tables do not know (none: they are
+            // built from the same people searcher)
+            let pick = |m: &[(u64, u64)]| -> Vec<u64> {
+                let mut seen = HashSet::new();
+                m.iter()
+                    .map(|x| x.1)
+                    .filter(|a| *a != 0 && seen.insert(*a))
+                    .take(5)
+                    .collect()
+            };
+            let v = self.people_match(q(), aff, false, Some(PEOPLE_FIRST_SCAN))?;
+            if v.is_empty() {
+                return Ok(None);
+            }
+            let a = pick(&v);
+            if a.len() < 5 && v.len() == PEOPLE_FIRST_SCAN {
+                return Ok(Some(pick(&self.people_match(q(), aff, false, None)?)));
+            }
+            Ok(Some(a))
         };
-        if !partial {
-            let v = self.people_match(
-                Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic)),
-                aff,
-                false,
-                None,
-            )?;
-            if !v.is_empty() {
-                return Ok((addrs(v), 1));
-            }
+        if !partial
+            && let Some(v) =
+                top(&|| Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic)))?
+        {
+            return Ok((v, 1));
         }
-        if n >= 3 {
-            let v = self.people_match(
-                Box::new(FuzzyTermQuery::new_prefix(term.clone(), 0, false)),
-                aff,
-                false,
-                None,
-            )?;
-            if !v.is_empty() {
-                return Ok((addrs(v), 2));
-            }
+        if n >= 3
+            && let Some(v) = top(&|| Box::new(FuzzyTermQuery::new_prefix(term.clone(), 0, false)))?
+        {
+            return Ok((v, 2));
         }
         if n >= 4 && !partial {
             let d = if n >= 8 { 2 } else { 1 };
-            let v = self.people_match(
-                Box::new(FuzzyTermQuery::new(term, d, true)),
-                aff,
-                false,
-                None,
-            )?;
-            if !v.is_empty() {
-                return Ok((addrs(v), 3));
+            if let Some(v) = top(&|| Box::new(FuzzyTermQuery::new(term.clone(), d, true)))? {
+                return Ok((v, 3));
             }
         }
         Ok((Vec::new(), 0))
@@ -1903,7 +2004,11 @@ impl Engine {
             })
             .collect();
         let aff = self.affinity();
-        self.people_match(Box::new(BooleanQuery::new(subs)), &aff, true, Some(cap))
+        Ok(self
+            .people_match(Box::new(BooleanQuery::new(subs)), &aff, true, Some(cap))?
+            .into_iter()
+            .map(|x| x.0)
+            .collect())
     }
 
     // ---- quoted-text fallback ----
