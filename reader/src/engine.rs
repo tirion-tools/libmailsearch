@@ -42,8 +42,8 @@ use mailsearch_core::{
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tantivy::columnar::ColumnValues;
 use tantivy::index::SegmentId;
@@ -950,9 +950,31 @@ impl SegPeople {
 }
 
 impl Aff {
+    /// The affinity of the people generation `s`, reading only the segments `cache` lacks (it
+    /// keeps the rows of `s`'s segments only).
+    fn of(
+        s: &Searcher,
+        cache: &Mutex<HashMap<SegmentId, Arc<SegPeople>>>,
+        scope: Option<&[u64]>,
+    ) -> Aff {
+        let rows: Vec<Arc<SegPeople>> = {
+            let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let segs = s.segment_readers();
+            c.retain(|id, _| segs.iter().any(|seg| seg.segment_id() == *id));
+            segs.iter()
+                .map(|seg| {
+                    c.entry(seg.segment_id())
+                        .or_insert_with(|| Arc::new(SegPeople::read(seg)))
+                        .clone()
+                })
+                .collect()
+        };
+        Aff::build(s, &rows, scope)
+    }
+
     /// Joins the live Person and Corr rows of every segment of `s` (`rows` in segment order) by
     /// correspondents.id; A only for the Person rows of the `scope` accounts (`None`: every account).
-    fn build(s: &Searcher, rows: &[SegPeople], scope: Option<&[u64]>) -> Aff {
+    fn build(s: &Searcher, rows: &[Arc<SegPeople>], scope: Option<&[u64]>) -> Aff {
         let mut aff = Aff::default();
         let segs = s.segment_readers();
         // Corr rows (id → sent, replied, message count, contact), sorted by id
@@ -1020,6 +1042,11 @@ pub struct Engine {
     /// affinity per account scope (`None` = every account), for the loaded people generation
     aff: HashMap<Option<Vec<u64>>, Arc<Aff>>,
     aff_accounts: Option<Vec<u64>>,
+    /// the affinity build of the loaded people generation for a scope, started at open and after a
+    /// reload that changed the people index ([`Engine::start_affinity`])
+    aff_job: Option<(Option<Vec<u64>>, std::thread::JoinHandle<Aff>)>,
+    /// people rows per segment (segments are immutable): a reload reads only the new segments
+    people_rows: Arc<Mutex<HashMap<SegmentId, Arc<SegPeople>>>>,
     cancel: Arc<AtomicBool>,
     /// a [`Engine::prefetch`] thread is running
     prefetching: Arc<AtomicBool>,
@@ -1029,6 +1056,12 @@ impl Engine {
     /// Opens the current index of a search root (`$data/search`) read-only after the fail-closed
     /// version check.
     pub fn open(root: &Path) -> Result<Engine, OpenError> {
+        let mut e = Engine::open_dir(root)?;
+        e.start_affinity();
+        Ok(e)
+    }
+
+    fn open_dir(root: &Path) -> Result<Engine, OpenError> {
         let n = read_current(root)
             .ok_or_else(|| OpenError::Io(format!("{}: no valid CURRENT", root.display())))?;
         let dir = root.join(idx_name(n));
@@ -1059,6 +1092,8 @@ impl Engine {
             owner: HashSet::new(),
             aff: HashMap::new(),
             aff_accounts: None,
+            aff_job: None,
+            people_rows: Arc::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             prefetching: Arc::new(AtomicBool::new(false)),
         })
@@ -1073,8 +1108,10 @@ impl Engine {
     /// pages of the old mapping. Returns the lease `(dir, gen)` to report as ReaderAt; `gen` is read
     /// before reloading, so the reader holds nothing older than it.
     pub fn reload(&mut self) -> Result<(u32, u64), OpenError> {
+        // a running build holds the previous generation's segments
+        self.join_affinity();
         if read_current(&self.root).is_some_and(|n| n != self.idx) {
-            let mut e = Engine::open(&self.root)?;
+            let mut e = Engine::open_dir(&self.root)?;
             let generation = e.mail.index.load_metas()?.opstamp;
             e.excluded = self.excluded.take();
             e.owner = std::mem::take(&mut self.owner);
@@ -1084,6 +1121,7 @@ impl Engine {
             e.aff_accounts = self.aff_accounts.take();
             *self = e;
             self.release();
+            self.start_affinity();
             return Ok((self.idx, generation));
         }
         let generation = self.mail.index.load_metas()?.opstamp;
@@ -1091,15 +1129,51 @@ impl Engine {
             .reader
             .reload()
             .map_err(|e| side_err(&self.mail.dir, e))?;
+        let mut people_changed = false;
         if let Some(p) = &self.people {
+            let before = p.side.reader.searcher().generation().segments().clone();
             p.side
                 .reader
                 .reload()
                 .map_err(|e| side_err(&p.side.dir, e))?;
+            people_changed = *p.side.reader.searcher().generation().segments() != before;
         }
-        self.aff.clear();
         self.release();
+        // the affinity depends on the people index only: a commit of mail alone keeps it
+        if people_changed {
+            self.aff.clear();
+            self.start_affinity();
+        }
         Ok((self.idx, generation))
+    }
+
+    /// Starts the affinity build of the loaded people generation for the current scope on a
+    /// background thread: the people scan (75–90 ms at 1M) then runs between an open or reload
+    /// and the first query, which joins it. Without a thread the first query builds it.
+    fn start_affinity(&mut self) {
+        self.join_affinity();
+        let Some(p) = &self.people else {
+            return;
+        };
+        let s = p.side.reader.searcher();
+        let rows = self.people_rows.clone();
+        let scope = self.aff_accounts.clone();
+        let sc = scope.clone();
+        if let Ok(h) = std::thread::Builder::new()
+            .name("mailsearch-affinity".into())
+            .spawn(move || Aff::of(&s, &rows, sc.as_deref()))
+        {
+            self.aff_job = Some((scope, h));
+        }
+    }
+
+    /// Waits for a running affinity build and keeps its result. A panic in the build is resumed
+    /// on this thread (the C ABI's catch boundary).
+    fn join_affinity(&mut self) {
+        if let Some((scope, h)) = self.aff_job.take() {
+            let a = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            self.aff.entry(scope).or_insert_with(|| Arc::new(a));
+        }
     }
 
     /// `madvise(MADV_DONTNEED)` every mapping, then (glibc) `malloc_trim`. Returns the bytes advised.
@@ -1841,16 +1915,22 @@ impl Engine {
     // ---- people ----
 
     fn affinity(&mut self) -> Arc<Aff> {
+        if self
+            .aff_job
+            .as_ref()
+            .is_some_and(|j| j.0 == self.aff_accounts)
+        {
+            self.join_affinity();
+        }
         if let Some(a) = self.aff.get(&self.aff_accounts) {
             return a.clone();
         }
         let aff = match &self.people {
-            Some(p) => {
-                let s = p.side.reader.searcher();
-                let rows: Vec<SegPeople> =
-                    s.segment_readers().iter().map(SegPeople::read).collect();
-                Aff::build(&s, &rows, self.aff_accounts.as_deref())
-            }
+            Some(p) => Aff::of(
+                &p.side.reader.searcher(),
+                &self.people_rows,
+                self.aff_accounts.as_deref(),
+            ),
             None => Aff::default(),
         };
         let a = Arc::new(aff);
