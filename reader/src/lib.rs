@@ -6,7 +6,8 @@
 //! every `mailsearch_*` entry point runs inside `catch_unwind`. A panic returns `MAILSEARCH_E_PANIC` (message:
 //! `mailsearch_last_error`) and poisons the handle: every later call on it returns `MAILSEARCH_E_POISONED` until
 //! `mailsearch_close`. `mailsearch_cancel` is the one call made from another thread: it only stores into the
-//! handle's atomic cancel flag. A SIGBUS (a mapped file truncated under the reader) is not a panic
+//! handle's atomic cancel flag. `mailsearch_prefetch` starts the one thread the library runs: it only reads index
+//! files by path through its own descriptors. A SIGBUS (a mapped file truncated under the reader) is not a panic
 //! and cannot be caught here; the directory layout and the reader lease prevent it.
 
 pub mod dir;
@@ -684,6 +685,32 @@ pub unsafe extern "C" fn mailsearch_release(g: *mut MailsearchHandle, bytes: *mu
             return arg("null bytes");
         }
         let n = h.e.release();
+        // SAFETY: non-null and writable (caller contract).
+        unsafe { *bytes = n };
+        MAILSEARCH_OK
+    })
+}
+
+/// Starts reading the open segments' term dictionaries, fast fields and fieldnorms into the page cache on a
+/// background thread ([`Engine::prefetch`]) and returns at once; `*bytes` = bytes it will read, 0 while an
+/// earlier prefetch is still running.
+///
+/// # Safety
+/// `bytes` must be valid for one write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mailsearch_prefetch(g: *mut MailsearchHandle, bytes: *mut u64) -> i32 {
+    with(g, |h| {
+        if bytes.is_null() {
+            return arg("null bytes");
+        }
+        let n = match h.e.prefetch() {
+            Ok(Some((n, _detached))) => n,
+            Ok(None) => 0,
+            Err(e) => {
+                set_last(format!("prefetch thread: {e}"));
+                return MAILSEARCH_E_IO;
+            }
+        };
         // SAFETY: non-null and writable (caller contract).
         unsafe { *bytes = n };
         MAILSEARCH_OK

@@ -113,6 +113,23 @@ impl RoDir {
         }
         n
     }
+
+    /// The files of the live mappings whose extension is one of `exts`, grouped in the order of `exts`, with
+    /// their lengths.
+    pub fn mapped_files(&self, exts: &[&str]) -> Vec<(PathBuf, u64)> {
+        let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<(usize, PathBuf, u64)> = maps
+            .iter()
+            .filter_map(|(p, w)| {
+                let m = w.upgrade()?;
+                let ext = p.extension()?.to_str()?;
+                let rank = exts.iter().position(|e| *e == ext)?;
+                Some((rank, self.root.join(p), m.len() as u64))
+            })
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, p, n)| (p, n)).collect()
+    }
 }
 
 impl Directory for RoDir {

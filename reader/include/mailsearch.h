@@ -165,6 +165,11 @@ int mailsearch_reload(MailsearchHandle* g, uint32_t* dir, uint64_t* gen);
 /* madvise(MADV_DONTNEED) every mapping + malloc_trim: after each reader reopen and at the end of a
  * typing session. *bytes = mapped bytes advised. */
 int mailsearch_release(MailsearchHandle* g, uint64_t* bytes);
+/* Starts reading the open segments' term dictionaries, fast fields and fieldnorms into the page cache on a
+ * background thread and returns at once, so a first query after the page cache was dropped does not wait on the
+ * disk: at open, after mailsearch_reload and at the first edit of a typing session. Nothing is mapped into the
+ * process. *bytes = bytes it will read; 0 while an earlier prefetch is still running. */
+int mailsearch_prefetch(MailsearchHandle* g, uint64_t* bytes);
 int mailsearch_num_docs(MailsearchHandle* g, uint64_t* n);
 int mailsearch_close(MailsearchHandle* g);
 /* Message of the last error on this thread; returns its full length (may exceed len). */

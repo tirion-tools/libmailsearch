@@ -718,6 +718,99 @@ fn open_side(path: &Path) -> Result<Side, OpenError> {
     Ok(Side { dir, index, reader })
 }
 
+/// The segment files a cold query reads most (term dictionaries, fast fields, fieldnorms), in prefetch order.
+/// At 100k a cold first page reads 14.2 MiB of term, 3.5 of fast and 0.7 of fieldnorm files; postings and
+/// positions are read only where the query's terms are.
+pub const PREFETCH_EXTS: [&str; 3] = ["term", "fast", "fieldnorm"];
+/// Range of one `POSIX_FADV_WILLNEED` call in [`Engine::prefetch`].
+pub const PREFETCH_CHUNK: u64 = 2 << 20;
+
+/// [`Engine::prefetch`]'s thread: readahead for every file, then a read of the pages still not in the page
+/// cache. Errors are ignored (a file gone after a reload is no longer needed).
+fn prefetch_files(files: &[(PathBuf, u64)]) {
+    use std::os::fd::AsRawFd;
+    let open: Vec<(std::fs::File, u64)> = files
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .filter_map(|(p, n)| Some((std::fs::File::open(p).ok()?, *n)))
+        .collect();
+    for (f, n) in &open {
+        let mut o = 0;
+        while o < *n {
+            // SAFETY: a plain syscall on an open descriptor.
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    o as libc::off_t,
+                    PREFETCH_CHUNK as libc::off_t,
+                    libc::POSIX_FADV_WILLNEED,
+                )
+            };
+            o += PREFETCH_CHUNK;
+        }
+    }
+    let mut buf = vec![0u8; 256 << 10];
+    for (f, n) in &open {
+        read_missing(f, *n, &mut buf);
+    }
+}
+
+/// Reads the pages of `f` (`n` bytes) that are not in the page cache (`mincore`), so a warm prefetch reads
+/// nothing.
+fn read_missing(f: &std::fs::File, n: u64, buf: &mut [u8]) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let len = n as usize;
+    let pages = n.div_ceil(page) as usize;
+    let mut v = vec![0u8; pages];
+    // SAFETY: a shared read-only mapping of an open file that is only passed to mincore (never read, so no
+    // page is faulted into this process) and unmapped before the pointer goes out of scope.
+    let resident = unsafe {
+        let m = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        );
+        if m == libc::MAP_FAILED {
+            false
+        } else {
+            let ok = libc::mincore(m, len, v.as_mut_ptr()) == 0;
+            libc::munmap(m, len);
+            ok
+        }
+    };
+    if !resident {
+        v.fill(0);
+    }
+    let mut i = 0;
+    while i < pages {
+        if v[i] & 1 == 1 {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < pages && v[j] & 1 == 0 {
+            j += 1;
+        }
+        let (mut o, end) = (i as u64 * page, (j as u64 * page).min(n));
+        while o < end {
+            let k = ((end - o) as usize).min(buf.len());
+            match f.read_at(&mut buf[..k], o) {
+                Ok(0) => break,
+                Ok(r) => o += r as u64,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
+        i = j;
+    }
+}
+
 struct People {
     side: Side,
     f: PeopleFields,
@@ -763,6 +856,8 @@ pub struct Engine {
     aff: HashMap<Option<Vec<u64>>, Arc<Aff>>,
     aff_accounts: Option<Vec<u64>>,
     cancel: Arc<AtomicBool>,
+    /// a [`Engine::prefetch`] thread is running
+    prefetching: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -800,6 +895,7 @@ impl Engine {
             aff: HashMap::new(),
             aff_accounts: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            prefetching: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -819,6 +915,7 @@ impl Engine {
             e.owner = std::mem::take(&mut self.owner);
             e.snow = std::mem::replace(&mut self.snow, Snowball::new(&[]));
             e.cancel = self.cancel.clone();
+            e.prefetching = self.prefetching.clone();
             e.aff_accounts = self.aff_accounts.take();
             *self = e;
             self.release();
@@ -854,6 +951,39 @@ impl Engine {
             libc::malloc_trim(0);
         }
         n
+    }
+
+    /// Reads the loaded segments' term dictionaries, fast fields and fieldnorms ([`PREFETCH_EXTS`], mail and
+    /// people) into the page cache on a background thread, so the first query after the cache was dropped
+    /// does not fault them in from disk one page at a time. The thread queues the whole of every file with
+    /// `POSIX_FADV_WILLNEED` in [`PREFETCH_CHUNK`] steps (one call reads ahead at most the device's
+    /// largest request, 2 MiB here), then reads what `mincore` still shows missing. It reads through file
+    /// descriptors, not the reader's mappings, so nothing is mapped into this process, and a warm prefetch
+    /// costs only the page cache lookups. Returns the bytes it will read and the thread, or `None` while an earlier
+    /// prefetch is still running.
+    pub fn prefetch(&self) -> std::io::Result<Option<(u64, std::thread::JoinHandle<()>)>> {
+        if self.prefetching.swap(true, Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let mut files = self.mail.dir.mapped_files(&PREFETCH_EXTS);
+        if let Some(p) = &self.people {
+            files.extend(p.side.dir.mapped_files(&PREFETCH_EXTS));
+        }
+        let bytes = files.iter().map(|(_, n)| n).sum();
+        let busy = self.prefetching.clone();
+        let t = std::thread::Builder::new()
+            .name("mailsearch-prefetch".into())
+            .spawn(move || {
+                prefetch_files(&files);
+                busy.store(false, Ordering::Release);
+            });
+        match t {
+            Ok(t) => Ok(Some((bytes, t))),
+            Err(e) => {
+                self.prefetching.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 
     pub fn num_docs(&self) -> u64 {

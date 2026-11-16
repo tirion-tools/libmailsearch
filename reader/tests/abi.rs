@@ -925,6 +925,58 @@ fn reload_lease_and_release() {
     close(g);
 }
 
+/// Bytes of the prefetched kinds of segment files under `dir`.
+fn prefetch_bytes(dir: &Path) -> u64 {
+    let mut n = 0;
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            n += prefetch_bytes(&p);
+        } else if p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| engine::PREFETCH_EXTS.contains(&x))
+        {
+            n += e.metadata().unwrap().len();
+        }
+    }
+    n
+}
+
+#[test]
+fn prefetch_reads_the_open_segment_files() {
+    let fx = fixture();
+    let want = prefetch_bytes(&fx.root.join("idx-1"));
+    assert!(want > 0);
+    let mut e = Engine::open(&fx.root).unwrap();
+    let (n, t) = e.prefetch().unwrap().unwrap();
+    assert_eq!(n, want);
+    t.join().unwrap();
+    // the next prefetch runs once the last one ended; after a switch it reads the new directory's files
+    write_index(&fx.root, 2, &corpus()[..3], false);
+    e.reload().unwrap();
+    let (n, t) = e.prefetch().unwrap().unwrap();
+    assert_eq!(n, prefetch_bytes(&fx.root.join("idx-2")));
+    t.join().unwrap();
+
+    let g = open(&fx.root).unwrap();
+    let mut b = u64::MAX;
+    // SAFETY: valid pointers (null bytes is the error case).
+    unsafe {
+        assert_eq!(mailsearch_prefetch(g, &mut b), MAILSEARCH_OK);
+        assert_eq!(
+            mailsearch_prefetch(g, std::ptr::null_mut()),
+            MAILSEARCH_E_ARG
+        );
+        assert_eq!(
+            mailsearch_prefetch(std::ptr::null_mut(), &mut b),
+            MAILSEARCH_E_ARG
+        );
+    }
+    assert_eq!(b, prefetch_bytes(&fx.root.join("idx-2")));
+    close(g);
+}
+
 #[test]
 fn cancel_from_another_thread() {
     let root = std::env::temp_dir().join(format!("mailsearch-abi-cancel-{}", std::process::id()));
