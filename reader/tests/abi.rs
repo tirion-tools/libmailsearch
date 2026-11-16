@@ -731,6 +731,40 @@ fn groups_negation_phrases_and_stems() {
 }
 
 #[test]
+fn stem_languages() {
+    let root = std::env::temp_dir().join(format!("mailsearch-abi-lang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    write_index(
+        &root,
+        1,
+        &[doc(1, 0, "Rechnung", "die zahlung ist offen")],
+        false,
+    );
+    let g = open(&root).unwrap();
+    let set = |codes: &[&str]| {
+        let p: Vec<*const c_char> = codes.iter().map(|c| c.as_ptr() as *const c_char).collect();
+        let l: Vec<usize> = codes.iter().map(|c| c.len()).collect();
+        // SAFETY: valid arrays.
+        unsafe { mailsearch_set_languages(g, p.as_ptr(), l.as_ptr(), p.len()) }
+    };
+    // English only: "zahlungen" has no English stem match
+    assert!(search(g, &[c("zahlungen")], q5()).list.is_empty());
+    assert_eq!(set(&["de", "xx"]), MAILSEARCH_OK);
+    let o = search(g, &[c("zahlungen")], q5());
+    assert_eq!(mids(&o.list), vec![1]);
+    assert!(o.list.iter().all(|h| h.tiers & engine::T_STEM != 0));
+    assert_eq!(set(&[]), MAILSEARCH_OK);
+    assert!(search(g, &[c("zahlungen")], q5()).list.is_empty());
+    // SAFETY: null arrays with n > 0 are refused.
+    assert_eq!(
+        unsafe { mailsearch_set_languages(g, std::ptr::null(), std::ptr::null(), 1) },
+        MAILSEARCH_E_ARG
+    );
+    close(g);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn people_suggestions_and_owner() {
     let fx = fixture();
     let g = open(&fx.root).unwrap();

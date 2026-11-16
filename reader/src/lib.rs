@@ -420,6 +420,36 @@ pub unsafe extern "C" fn mailsearch_set_owner(
     })
 }
 
+/// Snowball languages of the stem tier besides English (ISO 639-1 codes such as "de"; unknown codes are
+/// ignored); replaces the previous set.
+///
+/// # Safety
+/// `codes` and `lens` must be valid for `n` elements, each code for its length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mailsearch_set_languages(
+    g: *mut MailsearchHandle,
+    codes: *const *const c_char,
+    lens: *const usize,
+    n: usize,
+) -> i32 {
+    with(g, |h| {
+        // SAFETY: caller contract.
+        let (Some(c), Some(l)) = (unsafe { slice(codes, n) }, unsafe { slice(lens, n) }) else {
+            return arg("null codes/lens");
+        };
+        let mut v = Vec::with_capacity(n);
+        for (p, len) in c.iter().zip(l) {
+            // SAFETY: caller contract.
+            let Some(s) = (unsafe { text(*p, *len) }) else {
+                return arg("language code: null or not UTF-8");
+            };
+            v.push(s);
+        }
+        h.e.set_languages(&v);
+        MAILSEARCH_OK
+    })
+}
+
 /// Excluded message id set, applied inside the collector; replaces the previous set.
 ///
 /// # Safety

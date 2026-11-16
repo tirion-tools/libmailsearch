@@ -143,6 +143,9 @@ int mailsearch_current(const char* root, size_t root_len, uint32_t* dir);
 MailsearchHandle* mailsearch_open(const char* root, size_t root_len, int* err);
 /* Own addresses (mailbox identities) for the own-sent feature; replaces the previous set. */
 int mailsearch_set_owner(MailsearchHandle* g, const char* const* addrs, const size_t* lens, size_t n);
+/* Snowball languages of the stem tier besides English, as ISO 639-1 codes ("de", "fr", ...; da de el es fi fr hu it
+ * nl no pt ro ru sv tr are known, others are ignored); replaces the previous set. English is always on. */
+int mailsearch_set_languages(MailsearchHandle* g, const char* const* codes, const size_t* lens, size_t n);
 /* Excluded message id set (Trash, Junk, out-of-scope folders), applied inside the collector;
  * replaces the previous set. */
 int mailsearch_set_excluded(MailsearchHandle* g, const uint64_t* mids, size_t n);

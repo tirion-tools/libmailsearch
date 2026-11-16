@@ -62,7 +62,7 @@ Related projects:
   `PeopleFields`, `PersonInput` / `CorrInput` → `person_doc` / `corr_doc`; `stamp` / `check_stamp`; `read_current`,
   `idx_name`; `NORM_VERSION`, `LAYOUT_VERSION`, `tantivy_version`, `fnv1a64`. The on-disk layout is
   `<root>/CURRENT` naming the live `idx-N/`, each with a `VERSION` stamp, `mail/` and optionally `people/`.
-- **Reader** (C ABI, `mailsearch.h`): `mailsearch_versions`, `mailsearch_open`, `mailsearch_set_owner`,
+- **Reader** (C ABI, `mailsearch.h`): `mailsearch_versions`, `mailsearch_open`, `mailsearch_set_owner`, `mailsearch_set_languages`,
   `mailsearch_set_excluded`, `mailsearch_search`, `mailsearch_cancel`, `mailsearch_people`, `mailsearch_highlight`,
   `mailsearch_reload` / `mailsearch_release` (reader lease), `mailsearch_num_docs`, `mailsearch_close`,
   `mailsearch_last_error`. Queries are typed clause lists (`MailsearchQuery`; clause modes default, exact, phrase, prefix
