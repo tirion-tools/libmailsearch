@@ -2072,6 +2072,14 @@ impl Engine {
     }
 
     /// Tier and field bits of each address: OR of the positive terms per tier and per field.
+    ///
+    /// Each (tier, field) cell is one weight, the OR of the positive terms' subqueries of that tier
+    /// in that field's word and bigram fields (plus a cell for `hpfx`, which carries no field bit);
+    /// every subquery of `term_q` lies in exactly one tier and in the cells of its field, so the
+    /// cells cover the per-tier and per-field ORs, and each prefix or typo automaton runs once per
+    /// segment instead of once in its tier and again in its field. A cell is skipped for an
+    /// address (a whole segment) that already has both of its bits. Cheap cells (exact, stem) run
+    /// before the automatons.
     fn annotate(
         &self,
         searcher: &Searcher,
@@ -2088,48 +2096,24 @@ impl Engine {
             .filter(|c| !c.negate)
             .flat_map(|c| c.terms.iter())
             .collect();
-        let or = |tiers: Tiers, sel: Sel| -> Box<dyn TQuery> {
-            Box::new(BooleanQuery::new(
-                pos.iter()
-                    .map(|t| (Occur::Should, self.term_q(t, tiers, o, sel)))
-                    .collect(),
-            ))
+        let only = |exact, prefix, stem, typo| Tiers {
+            exact,
+            prefix,
+            stem,
+            typo,
         };
-        let tier_masks = [
-            (T_EXACT, EXACT),
-            (
-                T_PREFIX,
-                Tiers {
-                    exact: false,
-                    prefix: true,
-                    stem: false,
-                    typo: false,
-                },
-            ),
+        let has = |f: &dyn Fn(&TK) -> bool| pos.iter().any(|t| f(&t.tk));
+        let tiers = [
+            (T_EXACT, EXACT, true),
             (
                 T_STEM,
-                Tiers {
-                    exact: false,
-                    prefix: false,
-                    stem: true,
-                    typo: false,
-                },
+                only(false, false, true, false),
+                has(&|tk| matches!(tk, TK::Tiers { stems, .. } if !stems.is_empty())),
             ),
             (
-                T_TYPO,
-                Tiers {
-                    exact: false,
-                    prefix: false,
-                    stem: false,
-                    typo: true,
-                },
-            ),
-        ];
-        let has = |f: &dyn Fn(&TK) -> bool| pos.iter().any(|t| f(&t.tk));
-        for (bit, tiers) in tier_masks {
-            let present = match bit {
-                T_EXACT => true,
-                T_PREFIX => has(&|tk| {
+                T_PREFIX,
+                only(false, true, false, false),
+                has(&|tk| {
                     matches!(
                         tk,
                         TK::Tiers { prefix: true, .. }
@@ -2139,33 +2123,68 @@ impl Engine {
                             }
                     )
                 }),
-                T_STEM => has(&|tk| matches!(tk, TK::Tiers { stems, .. } if !stems.is_empty())),
-                _ => has(&|tk| matches!(tk, TK::Tiers { typo: true, .. })),
-            };
+            ),
+            (
+                T_TYPO,
+                only(false, false, false, true),
+                has(&|tk| matches!(tk, TK::Tiers { typo: true, .. })),
+            ),
+        ];
+        let mask = pos.iter().fold(0u32, |m, t| m | t.fields);
+        let cells: Vec<(u32, Sel)> = FIELD_BITS
+            .iter()
+            .filter(|(bit, _, _)| mask & bit != 0)
+            .map(|(bit, word, ng)| (*bit, Sel::Only(word, ng)))
+            .chain(std::iter::once((0, Sel::Only("hpfx", ""))))
+            .collect();
+        let es = EnableScoring::disabled_from_searcher(searcher);
+        let mut leaves: Vec<(u32, u32, Box<dyn Weight>)> = Vec::new();
+        for (tb, tier, present) in tiers {
             if !present {
                 continue;
             }
-            self.check_cancel()?;
-            let w = or(tiers, Sel::All).weight(EnableScoring::disabled_from_searcher(searcher))?;
-            for (k, m) in Self::matches(searcher, &*w, addrs)?.into_iter().enumerate() {
-                if m {
-                    out[k].0 |= bit;
-                }
+            for (fb, sel) in &cells {
+                let q = BooleanQuery::new(
+                    pos.iter()
+                        .map(|t| (Occur::Should, self.term_q(t, tier, o, *sel)))
+                        .collect(),
+                );
+                leaves.push((tb, *fb, q.weight(es)?));
             }
         }
-        let mask = pos.iter().fold(0u32, |m, t| m | t.fields);
-        for (bit, word, ng) in FIELD_BITS {
-            if mask & bit == 0 {
-                continue;
+        let done = |x: (u32, u32), tb: u32, fb: u32| x.0 & tb != 0 && x.1 & fb == fb;
+        let mut order: Vec<usize> = (0..addrs.len()).collect();
+        order.sort_unstable_by_key(|&i| (addrs[i].segment_ord, addrs[i].doc_id));
+        let mut i = 0;
+        while i < order.len() {
+            let so = addrs[order[i]].segment_ord;
+            let mut j = i;
+            while j < order.len() && addrs[order[j]].segment_ord == so {
+                j += 1;
             }
-            self.check_cancel()?;
-            let w = or(ALL, Sel::Only(word, ng))
-                .weight(EnableScoring::disabled_from_searcher(searcher))?;
-            for (k, m) in Self::matches(searcher, &*w, addrs)?.into_iter().enumerate() {
-                if m {
-                    out[k].1 |= bit;
+            let group = &order[i..j];
+            let seg = searcher.segment_reader(so);
+            for (tb, fb, w) in &leaves {
+                if group.iter().all(|&k| done(out[k], *tb, *fb)) {
+                    continue;
+                }
+                self.check_cancel()?;
+                let mut sc = w.scorer(seg, 1.0)?;
+                for &k in group {
+                    if done(out[k], *tb, *fb) {
+                        continue;
+                    }
+                    let d = addrs[k].doc_id;
+                    if sc.doc() < d {
+                        sc.seek(d);
+                    }
+                    if sc.doc() == d {
+                        out[k].0 |= tb;
+                        out[k].1 |= fb;
+                    }
                 }
             }
+            i = j;
         }
         Ok(out)
     }
