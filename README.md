@@ -18,7 +18,8 @@ in its own store and applies the structured filters the parser recognises (flags
 - **[Tantivy](https://github.com/quickwit-oss/tantivy)** (MIT): the index format, BM25 scoring, FST term dictionaries,
   phrase, prefix and fuzzy queries, and the base word analyzer (`SimpleTokenizer`, `LowerCaser`, `AsciiFoldingFilter`,
   `RemoveLongFilter`). The exact Tantivy version is part of the index stamp.
-- **[Snowball](https://snowballstem.org/)** stemming through [rust-stemmers](https://crates.io/crates/rust-stemmers).
+- **[Snowball](https://snowballstem.org/)** stemming through [frostem](https://crates.io/crates/frostem), the Snowball build
+  Tantivy's stemmer uses.
 - **[unicode-normalization](https://crates.io/crates/unicode-normalization)** for NFKC.
 
 Fixes to those projects go upstream, not into this repository.

@@ -1,7 +1,8 @@
 //! Snowball stemming for query-time stem expansion: the reader stems a
 //! query word and keeps the vocabulary terms whose stem is equal. The index holds no stems.
+//! The stemmers are frostem's, the Snowball build Tantivy's own stemmer uses.
 
-use rust_stemmers::{Algorithm, Stemmer};
+use frostem::{Algorithm, Stemmer};
 
 /// Snowball stemmers by language code (`en` always; others when the caller enables them).
 pub struct Snowball {
@@ -31,12 +32,12 @@ pub const LANGS: [(&str, Algorithm); 16] = [
 impl Snowball {
     /// English plus every known language of `extra` (unknown codes are ignored).
     pub fn new(extra: &[&str]) -> Snowball {
-        let mut langs = vec![("en", Stemmer::create(Algorithm::English))];
+        let mut langs = vec![("en", Stemmer::new(Algorithm::English))];
         for code in extra {
             if let Some((c, a)) = LANGS.iter().find(|(c, _)| c == code)
                 && !langs.iter().any(|(l, _)| l == c)
             {
-                langs.push((c, Stemmer::create(*a)));
+                langs.push((c, Stemmer::new(*a)));
             }
         }
         Snowball { langs }
@@ -65,5 +66,47 @@ mod tests {
         let v: Vec<String> = s.stems("invoices").map(|x| x.1).collect();
         assert_eq!(v, vec!["invoic", "invoic"]);
         assert!(eligible("mail") && !eligible("ab1c") && !eligible("abc"));
+    }
+
+    /// Every language stems words of every script without panicking (rust-stemmers 1.2.0's Greek stemmer panicked on
+    /// multibyte suffixes, e.g. "αντιθετε").
+    #[test]
+    fn every_language_stems_any_word() {
+        let codes: Vec<&str> = LANGS.iter().map(|(c, _)| *c).collect();
+        let s = Snowball::new(&codes);
+        assert_eq!(s.langs.len(), LANGS.len());
+        let words = [
+            "",
+            "a",
+            "invoices",
+            "zahlungen",
+            "factures",
+            "facturas",
+            "счета",
+            "fatture",
+            "faturas",
+            "facturen",
+            "fakturor",
+            "fakturaer",
+            "laskut",
+            "számlák",
+            "facturi",
+            "faturalar",
+            "τιμολόγια",
+            "αντιθετε",
+            "会議室",
+            "ﬁnance",
+            "e\u{301}te\u{301}",
+            "\u{200b}",
+            "ǅ",
+            "İstanbul",
+            "ß",
+        ];
+        for w in words {
+            let stems: Vec<String> = s.stems(w).map(|x| x.1).collect();
+            assert_eq!(stems.len(), LANGS.len(), "{w}");
+        }
+        let el = Snowball::new(&["el"]);
+        assert_eq!(el.stems("αντιθετε").nth(1).unwrap().1, "ανετ");
     }
 }
