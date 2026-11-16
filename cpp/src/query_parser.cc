@@ -330,6 +330,17 @@ std::string quote(std::string_view text) {
   return out;
 }
 
+// A Person address inside `<…>`: the bytes that would end the value word or be read as an escape are escaped.
+std::string escape_address(std::string_view a) {
+  std::string out;
+  out.reserve(a.size() + 2);
+  for (const char ch : a) {
+    if (ch == '\\' || ch == ',' || is_ws(ch) || is_structural(ch)) out.push_back('\\');
+    out.push_back(ch);
+  }
+  return out;
+}
+
 // Filter / date values: quoted when they would not lex back as one value word.
 std::string value_text(std::string_view v) {
   if (v.empty()) return "\"\"";
@@ -543,7 +554,9 @@ class Parser {
       alts.push_back(*first);
       near(*first);
     }
-    while (!full_) {
+    // Inside braces the list is the OR: `{a OR b c}` is one Or of three. A nested Or would print in parentheses the
+    // text did not have, so its canonical text could nest past kMaxDepth and re-parse truncated.
+    while (!braces && !full_) {
       const size_t save = pos_;
       skip_ws();
       if (!op_word("OR")) {
@@ -662,7 +675,7 @@ class Parser {
       hint(HintKind::kTreatedAsText, begin, pos_);
       return term(std::move(text), Field::kText, TermMode::kDefault, span_from(begin));
     }
-    if (auto kw = keyword(begin)) return *kw;
+    if (auto kw = keyword(begin, depth)) return *kw;
     if (!negated && depth == 0 && !braces && o_.bare_dates) {
       if (auto d = bare_date(begin)) return d;
     }
@@ -757,7 +770,7 @@ class Parser {
   }
 
   // `name:value…` at `begin`. nullopt = not a keyword (the caller reads a plain word).
-  std::optional<std::optional<uint32_t>> keyword(size_t begin) {
+  std::optional<std::optional<uint32_t>> keyword(size_t begin, size_t depth) {
     size_t p = pos_;
     if (p >= s_.size() || !is_alpha(s_[p])) return std::nullopt;
     while (p < s_.size() && ((s_[p] >= 'a' && s_[p] <= 'z') || (s_[p] >= 'A' && s_[p] <= 'Z') || (s_[p] >= '0' && s_[p] <= '9') ||
@@ -780,7 +793,12 @@ class Parser {
     pos_ = vstart;
     bool negate = false;
     if (s_[pos_] == '-' && !ends_word(pos_ + 1) && s_[pos_ + 1] != ',') {
-      negate = true;
+      // `name:-value` is `-name:value`, so the depth rule of `-` applies (canonical text prints the leading `-`).
+      if (depth + 1 >= kMaxDepth) {
+        hint(HintKind::kIgnored, pos_, pos_ + 1);
+      } else {
+        negate = true;
+      }
       ++pos_;
     }
     const std::vector<Item> items = value_items();
@@ -1032,7 +1050,7 @@ class Printer {
         if (n.me) return out + "me";
         for (size_t i = 0; i < n.addresses.size(); ++i) {
           if (i) out.push_back(',');
-          out += "<" + n.addresses[i] + ">";
+          out += "<" + escape_address(n.addresses[i]) + ">";
         }
         return out;
       }

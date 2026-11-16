@@ -417,8 +417,14 @@ std::optional<Period> parse_date_value(std::string_view value, const DateOptions
 }
 
 size_t match_date_phrase(std::span<const std::string_view> words, const DateOptions& options, Period* out) {
-  if (words.empty()) return 0;
-  Matcher m(words.first(std::min<size_t>(words.size(), 16)), options, true);
+  // A word holding the range operator ends the phrase: the chip prints as `date:"<source text>"`, and that value
+  // would re-parse as a `..` range ("march 2.." would otherwise read as March 2, its dots stripped like "July 5.").
+  size_t n = std::min<size_t>(words.size(), 16);
+  for (size_t i = 0; i < n; ++i) {
+    if (words[i].find("..") != std::string_view::npos) n = i;
+  }
+  if (n == 0) return 0;
+  Matcher m(words.first(n), options, true);
   auto r = m.at(0);
   if (!r) return 0;
   *out = r->p;

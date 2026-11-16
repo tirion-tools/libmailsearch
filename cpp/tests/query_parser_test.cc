@@ -425,6 +425,19 @@ TEST_F(Query, DatePhrasesInBareTextBecomeChips) {
     for (const auto& n : rr.query.nodes) EXPECT_NE(n.kind, s::NodeKind::kDateRange) << in;
     expect_round_trip(in);
   }
+  // A word holding the range operator `..` ends the phrase: `date:"march 2.."` would re-parse as a range
+  // (fuzz finding: "march 2.." became March 2 and its canonical text a term).
+  for (const char* in : {"march 2..", "march 2...", "2.. march", "march..", "today.. x"}) {
+    auto rr = parse(in);
+    for (const auto& n : rr.query.nodes) EXPECT_TRUE(n.kind != s::NodeKind::kDateRange || n.source_text.find("..") == std::string::npos) << in;
+    expect_round_trip(in);
+  }
+  r = parse("march 2..");
+  t = top(r);
+  ASSERT_EQ(t.size(), 2u);
+  EXPECT_EQ(t[0]->source_text, "march");
+  EXPECT_EQ(t[1]->text, "2..");
+
   // Escaped date words are text, and print escaped.
   r = parse("\\today report");
   EXPECT_EQ(top(r)[0]->kind, s::NodeKind::kTerm);
@@ -478,6 +491,9 @@ TEST_F(Query, CanonicalRoundTrip) {
       "from:", "from:,", "from:a,", "is:", "notes:a,b", "IN:Snoozed", "has:ATTACHMENT", "importance:normal",
       "msgid:<a@b>", "larger:0", "smaller:5g", "between yesterday and today", "since last week", "q2 2025 report",
       "invoice 5 july march 2024", "07.05.2024 x", "march, report", "monday OR tuesday", "a OR last march",
+      "{a OR b c}", "{a OR b OR c {d OR e}}", "-{x OR y}",
+      "((((((((((((((( tag:-x tag:y)))))))))))))))",
+      R"(from:<a\\b@c.d>)", R"(from:jo,<a\,b@c.d>)", R"(to:<a\)b@c.d> x)", R"(cc:<a\ b@c.d>)",
   };
   for (const char* in : inputs) expect_round_trip(in);
 }
