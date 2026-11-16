@@ -14,8 +14,8 @@
 //!   [`Qfb::Conv`] fallback). [`Hits`] has `top` (Top hits, with recency and the quoted fallback),
 //!   `date` (newest first), `rel` (relevance order: no recency, quoted 0.25; filled when
 //!   `Query::relevance` or `Opts::rel_list`), `count`, `count_capped`, `from_recent`, `corrected`,
-//!   `labels` (tier label per Top hit: 0 exact/prefix, 1 stem only, 2 typo only) and `info`
-//!   (timings and counters).
+//!   `labels` (tier label per Top hit: 0 exact/prefix, 1 stem only, 2 typo only), `folded` (the
+//!   copies collapse folded into each row, with `Opts::folded`) and `info` (timings and counters).
 //! - [`Engine::oracle`]`(&Query, &Opts, &HashSet<u64> targets) -> Oracle`: a per-query
 //!   evidence record over the complete matched set ([`Oracle::to_json`] prints it as one JSON line).
 //! - [`Engine::set_excluded`], [`Engine::set_owner`], [`Engine::set_languages`],
@@ -285,6 +285,8 @@ pub struct Opts {
     pub qfb_w: f32,
     /// also fill `Hits::rel` when the query asks for the date list (bench)
     pub rel_list: bool,
+    /// fill `Hits::folded` (evaluation: a copy folded into a row counts as found)
+    pub folded: bool,
 }
 
 impl Default for Opts {
@@ -313,6 +315,7 @@ impl Default for Opts {
             qfb: Qfb::Conv,
             qfb_w: 1.0,
             rel_list: false,
+            folded: false,
         }
     }
 }
@@ -346,7 +349,17 @@ pub struct Hits {
     pub corrected: bool,
     /// per Top hit: 0 exact/prefix, 1 stem only, 2 typo only
     pub labels: Vec<u8>,
+    /// with `Opts::folded`: the copies collapse folded into each row
+    pub folded: Folded,
     pub info: Vec<(&'static str, f64)>,
+}
+
+/// Copies result-time collapse folded into a row, per list, as (row index, the copy's `skey`).
+#[derive(Clone, Debug, Default)]
+pub struct Folded {
+    pub top: Vec<(u32, u64)>,
+    pub date: Vec<(u32, u64)>,
+    pub rel: Vec<(u32, u64)>,
 }
 
 #[derive(Debug)]
@@ -2173,12 +2186,15 @@ impl Engine {
                 .map(|(lo, hi)| ((lo.max(0) as u64) << 20, (hi.max(0) as u64) << 20)),
             account: q.account,
         };
+        let tb = Instant::now();
         let Some(mut query) = self.build(&cls, ALL, &fl, o, None) else {
             return Ok(Hits {
                 info,
                 ..Default::default()
             });
         };
+        info.push(("build_ms", ms(tb)));
+        let ts = Instant::now();
         if q.typing || q.before_key != 0 {
             self.ensure_zones(&searcher);
         }
@@ -2189,6 +2205,7 @@ impl Engine {
             None
         };
         let aff = self.affinity();
+        info.push(("setup_ms", ms(ts)));
         let rel_wanted = (q.relevance || o.rel_list) && !q.skip_list;
         let need_rank = (!q.skip_top && q.n_top > 0) || rel_wanted;
         let need_date = !q.skip_list && q.n_list > 0;
@@ -2312,6 +2329,7 @@ impl Engine {
                     pset.extend(addrs);
                 }
             }
+            let tf = Instant::now();
             for (skip, addrs) in fuzzy {
                 let rest = Self::without(&cls, skip);
                 if let Some(q2) = self.build(&rest, ALL, &fl, o, Some(self.sender_filter(&addrs))) {
@@ -2319,6 +2337,7 @@ impl Engine {
                     extra_people.extend(f2.newest);
                 }
             }
+            info.push(("pfuzzy_ms", ms(tf)));
             info.push(("people_ms", ms(tp)));
         }
         let mut hits = Hits {
@@ -2327,6 +2346,7 @@ impl Engine {
             ..Default::default()
         };
         // date list (copies collapse by duplicate key, newest kept)
+        let td = Instant::now();
         let mut date_c: Vec<Cand> = Vec::new();
         if need_date {
             let page;
@@ -2361,10 +2381,13 @@ impl Engine {
                 );
                 dl.sort_unstable_by(|a, b| b.skey.cmp(&a.skey).then(b.mid.cmp(&a.mid)));
             }
-            let (rows, kept) = collapse(dl.iter().map(|c| (c, 0f64)), q.collapse, q.n_list);
+            let (rows, kept, folded) =
+                collapse(dl.iter().map(|c| (c, 0f64)), q.collapse, q.n_list, o.folded);
             hits.date = rows;
+            hits.folded.date = folded;
             date_c = kept;
         }
+        info.push(("date_ms", ms(td)));
         // ranking
         let mut top_c: Vec<Cand> = Vec::new();
         let mut rel_c: Vec<Cand> = Vec::new();
@@ -2432,8 +2455,9 @@ impl Engine {
                     .collect();
                 // the reader returns messages: Top hits collapse copies only (conversations are
                 // grouped by the caller's conversation view)
-                let (rows, picked) = rank(&cands, sc, q.collapse, q.n_top);
+                let (rows, picked, folded) = rank(&cands, sc, q.collapse, q.n_top, o.folded);
                 hits.top = rows;
+                hits.folded.top = folded;
                 top_c = picked;
             }
             if rel_wanted {
@@ -2442,8 +2466,9 @@ impl Engine {
                     .enumerate()
                     .map(|(k, x)| (f.wt * (cands[k].score as f64 / maxb0) + rest(x), k))
                     .collect();
-                let (rows, picked) = rank(&cands, sc, q.collapse, q.n_list);
+                let (rows, picked, folded) = rank(&cands, sc, q.collapse, q.n_list, o.folded);
                 hits.rel = rows;
+                hits.folded.rel = folded;
                 rel_c = picked;
             }
             info.push(("rank_ms", ms(tr)));
@@ -2455,6 +2480,8 @@ impl Engine {
             addrs.extend(rel_c.iter().map(|c| c.addr));
             addrs.extend(date_c.iter().map(|c| c.addr));
             let ann = self.annotate(&searcher, &cls, o, &addrs)?;
+            info.push(("bits_ms", ms(ta)));
+            info.push(("ann_addrs", addrs.len() as f64));
             let (top_n, rel_n) = (top_c.len(), rel_c.len());
             for (k, h) in hits.top.iter_mut().enumerate() {
                 (h.tiers, h.fields) = ann[k];
@@ -2758,12 +2785,15 @@ fn d_feature(date: i64, hint: Option<(i64, i64)>) -> f64 {
 
 /// Keeps the first row of every group of copies (rows in final order; a copy shares the
 /// Message-ID hash or the body hash with a kept row), counting the folded copies; at most `k`
-/// rows. Returns the rows and the kept candidates.
+/// rows. Returns the rows, the kept candidates and, when `record`, the folded copies as (row,
+/// skey).
 fn collapse<'a>(
     rows: impl Iterator<Item = (&'a Cand, f64)>,
     on: bool,
     k: usize,
-) -> (Vec<Hit>, Vec<Cand>) {
+    record: bool,
+) -> (Vec<Hit>, Vec<Cand>, Vec<(u32, u64)>) {
+    let mut folded: Vec<(u32, u64)> = Vec::new();
     let mut out: Vec<Hit> = Vec::new();
     let mut kept: Vec<Cand> = Vec::new();
     let mut by_mid: HashMap<u64, usize> = HashMap::new();
@@ -2782,6 +2812,9 @@ fn collapse<'a>(
             let row = match found {
                 Some(i) => {
                     out[i].copies += 1;
+                    if record {
+                        folded.push((i as u32, c.skey));
+                    }
                     i
                 }
                 None if out.len() >= k => continue,
@@ -2807,12 +2840,18 @@ fn collapse<'a>(
         });
         kept.push(*c);
     }
-    (out, kept)
+    (out, kept, folded)
 }
 
 /// The `k` best of `sc` (score, candidate index), copies collapsed: twice the window first, the
 /// whole list only if that leaves fewer than `k` distinct rows .
-fn rank(cands: &[Cand], sc: Vec<(f64, usize)>, on: bool, k: usize) -> (Vec<Hit>, Vec<Cand>) {
+fn rank(
+    cands: &[Cand],
+    sc: Vec<(f64, usize)>,
+    on: bool,
+    k: usize,
+    record: bool,
+) -> (Vec<Hit>, Vec<Cand>, Vec<(u32, u64)>) {
     let ord = |a: &(f64, usize), b: &(f64, usize)| {
         b.0.total_cmp(&a.0)
             .then(cands[b.1].skey.cmp(&cands[a.1].skey))
@@ -2820,7 +2859,7 @@ fn rank(cands: &[Cand], sc: Vec<(f64, usize)>, on: bool, k: usize) -> (Vec<Hit>,
     };
     let want = k.min(sc.len());
     if want == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let window = if on { (want * 2).min(sc.len()) } else { want };
     let pick = |w: usize| {
@@ -2830,7 +2869,7 @@ fn rank(cands: &[Cand], sc: Vec<(f64, usize)>, on: bool, k: usize) -> (Vec<Hit>,
             v.truncate(w);
         }
         v.sort_by(ord);
-        collapse(v.iter().map(|x| (&cands[x.1], x.0)), on, want)
+        collapse(v.iter().map(|x| (&cands[x.1], x.0)), on, want, record)
     };
     let r = pick(window);
     if on && r.0.len() < want && sc.len() > window {

@@ -558,6 +558,55 @@ fn collapse_copies_not_conversations() {
 }
 
 #[test]
+fn folded_copies_per_row() {
+    let fx = fixture();
+    let mut e = Engine::open(&fx.root).unwrap();
+    let q = Query {
+        clauses: vec![engine::Clause {
+            text: "duplicate".into(),
+            fields: engine::F_TEXT,
+            ..Default::default()
+        }],
+        now: now(),
+        n_top: 5,
+        n_list: 10,
+        ..Default::default()
+    };
+    let h = e.search(&q, &Opts::default()).unwrap();
+    assert!(h.folded.top.is_empty() && h.folded.date.is_empty() && h.folded.rel.is_empty());
+    let all = e
+        .search(
+            &Query {
+                collapse: false,
+                ..q.clone()
+            },
+            &Opts::default(),
+        )
+        .unwrap();
+    let mut copies: Vec<u64> = all.date.iter().map(|x| x.skey).collect();
+    copies.sort_unstable();
+    assert_eq!(copies.len(), 3);
+    let o = Opts {
+        folded: true,
+        rel_list: true,
+        ..Opts::default()
+    };
+    let h = e.search(&q, &o).unwrap();
+    // 8, 9 and 17 are one row in every list; the other two are folded into it
+    for (rows, folded) in [
+        (&h.top, &h.folded.top),
+        (&h.date, &h.folded.date),
+        (&h.rel, &h.folded.rel),
+    ] {
+        assert_eq!(rows.len(), 1);
+        assert!(folded.iter().all(|f| f.0 == 0), "{folded:?}");
+        let mut v: Vec<u64> = folded.iter().map(|f| f.1).chain([rows[0].skey]).collect();
+        v.sort_unstable();
+        assert_eq!(v, copies);
+    }
+}
+
+#[test]
 fn quoted_fallback_in_top_hits_only() {
     let fx = fixture();
     let mut e = Engine::open(&fx.root).unwrap();
