@@ -1,6 +1,8 @@
 //! The reader's own read-only Tantivy directory: every file is mapped once and registered, so [`RoDir::advise_all`] can
 //! `madvise(MADV_DONTNEED)` every live mapping and drop its pages from this process. Writes, deletes
-//! and locks are refused: the indexer is the only writer.
+//! and locks are refused: the indexer is the only writer. A segment file Tantivy decodes at open
+//! (`mailsearch_core::integrity`) is checked against its footer CRC when it is first mapped; a
+//! mismatch fails the open and is remembered ([`RoDir::corrupt`]).
 
 use std::collections::HashMap;
 use std::io;
@@ -46,6 +48,7 @@ impl FileHandle for MapHandle {
 pub struct RoDir {
     root: PathBuf,
     maps: Arc<Mutex<HashMap<PathBuf, Weak<memmap2::Mmap>>>>,
+    corrupt: Arc<Mutex<Option<String>>>,
 }
 
 fn read_err(p: &Path, e: io::Error) -> OpenReadError {
@@ -74,7 +77,16 @@ impl RoDir {
         Ok(RoDir {
             root: root.to_path_buf(),
             maps: Default::default(),
+            corrupt: Default::default(),
         })
+    }
+
+    /// The first file that failed its integrity check, with the reason.
+    pub fn corrupt(&self) -> Option<String> {
+        self.corrupt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `madvise(MADV_DONTNEED)` on every live mapping. Returns the bytes advised.
@@ -124,6 +136,17 @@ impl Directory for RoDir {
             // a reader generation may hold (lease).
             Arc::new(unsafe { memmap2::Mmap::map(&f) }.map_err(|e| read_err(p, e))?)
         };
+        if mailsearch_core::integrity::checked_at_open(p)
+            && let Err(e) =
+                mailsearch_core::integrity::check_file(OwnedBytes::new(MapArc(m.clone())))
+        {
+            let msg = format!("{}: {e}", p.display());
+            self.corrupt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(|| msg.clone());
+            return Err(read_err(p, io::Error::new(io::ErrorKind::InvalidData, msg)));
+        }
         maps.insert(p.to_path_buf(), Arc::downgrade(&m));
         Ok(Arc::new(MapHandle(m)))
     }

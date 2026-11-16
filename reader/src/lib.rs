@@ -28,6 +28,7 @@ pub const MAILSEARCH_E_VERSION: i32 = -3;
 pub const MAILSEARCH_E_PANIC: i32 = -4;
 pub const MAILSEARCH_E_POISONED: i32 = -5;
 pub const MAILSEARCH_E_CANCELLED: i32 = -6;
+pub const MAILSEARCH_E_CORRUPT: i32 = -7;
 
 pub const MAILSEARCH_C_PARTIAL: u32 = 1 << 0;
 pub const MAILSEARCH_C_NEGATE: u32 = 1 << 1;
@@ -289,6 +290,7 @@ fn open_err(e: OpenError) -> i32 {
     let code = match e {
         OpenError::Version(_) => MAILSEARCH_E_VERSION,
         OpenError::Io(_) => MAILSEARCH_E_IO,
+        OpenError::Corrupt(_) => MAILSEARCH_E_CORRUPT,
     };
     set_last(e.to_string());
     code
@@ -313,6 +315,38 @@ pub unsafe extern "C" fn mailsearch_versions(
             *layout_version = mailsearch_core::LAYOUT_VERSION;
         }
         MAILSEARCH_OK
+    })
+}
+
+/// The active directory number of `root` (`CURRENT` → `idx-N`) without opening it.
+///
+/// # Safety
+/// `root` must be valid for `root_len` bytes; `dir` valid for one write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mailsearch_current(
+    root: *const c_char,
+    root_len: usize,
+    dir: *mut u32,
+) -> i32 {
+    guard(|| {
+        // SAFETY: caller contract.
+        let Some(r) = (unsafe { text(root, root_len) }).filter(|r| !r.is_empty()) else {
+            return arg("root: null, empty or not UTF-8");
+        };
+        if dir.is_null() {
+            return arg("null dir");
+        }
+        match mailsearch_core::read_current(Path::new(r)) {
+            Some(n) => {
+                // SAFETY: non-null and writable (caller contract).
+                unsafe { *dir = n };
+                MAILSEARCH_OK
+            }
+            None => {
+                set_last(format!("{r}: no valid CURRENT"));
+                MAILSEARCH_E_IO
+            }
+        }
     })
 }
 

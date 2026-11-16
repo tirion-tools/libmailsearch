@@ -6,8 +6,9 @@
 //! Writer API: [`schema`], [`register`], [`Fields`], [`DocInput`] →
 //! [`to_tantivy`]; [`people_schema`], [`PeopleFields`], [`PersonInput`] / [`CorrInput`] →
 //! [`person_doc`] / [`corr_doc`], [`people_term`]; [`stamp`] / [`check_stamp`]; [`read_current`],
-//! [`idx_name`].
+//! [`idx_name`]; [`integrity::check_index`] before a writer opens segments.
 
+pub mod integrity;
 pub mod layout;
 pub mod norm;
 pub mod stem;

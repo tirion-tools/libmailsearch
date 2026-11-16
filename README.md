@@ -81,8 +81,18 @@ needs a profile with the same setting. Consumers of the C++ part `add_subdirecto
   layout or Tantivy version, and catches every panic at the C ABI (`MAILSEARCH_E_PANIC`, then `MAILSEARCH_E_POISONED`).
   A file truncated under the reader (SIGBUS) is not a panic; the writer's directory layout and the reader lease
   prevent it.
-- **Known limits.** "At most 3 typo candidates per term" is not enforced: the typo tier uses Tantivy's
-  `FuzzyTermQuery` (distance 1, transpositions) as is. Linux and other Unix targets (the reader uses `madvise`).
+- **Checksums before Tantivy decodes.** Tantivy 0.27 trusts lengths it reads from index files: a corrupted count makes it
+  reserve memory up front, and the failed allocation aborts the process (no unwind; upstream report drafted). The
+  files a segment decodes when it opens (doc store, fast fields, field norms, delete bitset) are checked against their
+  footer CRC32 when the reader first maps them (`mailsearch_core::integrity`); a mismatch fails `mailsearch_open` /
+  `mailsearch_reload` with `MAILSEARCH_E_CORRUPT`. A writer calls `integrity::check_index` before it opens segments.
+  Cost: one pass over those files per mapping (no stored fields: they are a few bytes per document); term
+  dictionaries, postings and positions stay lazily paged.
+- **Known limits.** A checksum stops corruption, not a crafted index: a hostile writer can compute it, and Tantivy can
+  then still abort the process. A caller that maps an index written by another process keeps a crash guard keyed on
+  `mailsearch_current` (the directory to refuse after a crash inside the reader). "At most 3 typo candidates per term"
+  is not enforced: the typo tier uses Tantivy's `FuzzyTermQuery` (distance 1, transpositions) as is. Linux and other
+  Unix targets (the reader uses `madvise`).
 
 ## Tests
 
@@ -92,8 +102,11 @@ needs a profile with the same setting. Consumers of the C++ part `add_subdirecto
   collapse, exclusion, CJK, typing path, people, highlight, lease, cancel, panic poisoning), and the vectors again.
 - `cpp/tests/query_parser_test.cc` (GoogleTest): keyword and alias vectors, operators, dates against a fixed "now",
   the canonical round trip, and the never-fails property on random input.
-- Fuzz: `fuzz/` (cargo-fuzz `reader_index`: the reader on corrupted index files) and `cpp/fuzz/` (libFuzzer
-  `fuzz_query_parser`: parse, round trip, chip edits).
+- `reader/tests/corrupt.rs`: replays the `reader_index` regression inputs (`fuzz/corpus/reader_index/`) through the
+  fuzz harness (`reader/tests/corrupt_index/`, shared with the fuzz target); the two Tantivy findings (doc-store
+  skip index, fast-field column directory) must return `MAILSEARCH_E_CORRUPT`.
+- Fuzz: `fuzz/` (cargo-fuzz `reader_index`: the reader on corrupted index files; seeds and regression inputs in
+  `fuzz/corpus/reader_index/`) and `cpp/fuzz/` (libFuzzer `fuzz_query_parser`: parse, round trip, chip edits).
 
 ## Gates
 

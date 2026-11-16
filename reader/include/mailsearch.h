@@ -21,11 +21,12 @@ extern "C" {
 enum {
   MAILSEARCH_OK = 0,
   MAILSEARCH_E_ARG = -1,       /* null pointer, bad enum/flag, invalid UTF-8, capacity too small */
-  MAILSEARCH_E_IO = -2,        /* index missing or unreadable (no CURRENT, corrupt segment) */
+  MAILSEARCH_E_IO = -2,        /* index missing or unreadable (no CURRENT, unreadable segment) */
   MAILSEARCH_E_VERSION = -3,   /* VERSION missing, malformed or different: fail closed */
   MAILSEARCH_E_PANIC = -4,     /* the call panicked; the handle is now poisoned */
   MAILSEARCH_E_POISONED = -5,  /* an earlier call on this handle panicked */
   MAILSEARCH_E_CANCELLED = -6, /* mailsearch_cancel was called while mailsearch_search ran */
+  MAILSEARCH_E_CORRUPT = -7,   /* a segment file failed its checksum (open, reload): the caller rebuilds the index */
 };
 
 typedef struct MailsearchHandle MailsearchHandle;
@@ -130,7 +131,13 @@ typedef struct MailsearchSpan {
 /* norm_version and layout_version this library reads. */
 int mailsearch_versions(uint32_t* norm_version, uint32_t* layout_version);
 
-/* root = $data/search. NULL with *err set on failure (MAILSEARCH_E_VERSION fails closed). */
+/* The active directory number N of root ($data/search/CURRENT names idx-N), without opening it: a caller
+ * that guards against a crash inside the reader keys its guard on it. MAILSEARCH_E_IO when CURRENT is
+ * missing or malformed. */
+int mailsearch_current(const char* root, size_t root_len, uint32_t* dir);
+/* root = $data/search. NULL with *err set on failure (MAILSEARCH_E_VERSION fails closed; MAILSEARCH_E_CORRUPT:
+ * a segment file failed its checksum). A checksum stops corruption, not a crafted index: Tantivy can abort
+ * the process on one (README "Known limits"). */
 MailsearchHandle* mailsearch_open(const char* root, size_t root_len, int* err);
 /* Own addresses (mailbox identities) for the own-sent feature; replaces the previous set. */
 int mailsearch_set_owner(MailsearchHandle* g, const char* const* addrs, const size_t* lens, size_t n);
@@ -148,7 +155,7 @@ int mailsearch_people(MailsearchHandle* g, const char* prefix, size_t len, uint6
  * Returns the number written (>= 0) or an error. */
 int mailsearch_highlight(MailsearchHandle* g, const MailsearchQuery* q, const char* text, size_t len, MailsearchSpan* spans, size_t cap);
 /* After IndexCommitted: reopen at the newest commit; also releases the pages of the old mapping.
- * (*dir, *gen) is the lease to report as ReaderAt. */
+ * (*dir, *gen) is the lease to report as ReaderAt. Errors as mailsearch_open. */
 int mailsearch_reload(MailsearchHandle* g, uint32_t* dir, uint64_t* gen);
 /* madvise(MADV_DONTNEED) every mapping + malloc_trim: after each reader reopen and at the end of a
  * typing session. *bytes = mapped bytes advised. */

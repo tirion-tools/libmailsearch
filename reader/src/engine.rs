@@ -353,6 +353,8 @@ pub enum OpenError {
     Io(String),
     /// VERSION missing, malformed or different (fail closed)
     Version(StampError),
+    /// a segment file failed its integrity check (`mailsearch_core::integrity`)
+    Corrupt(String),
 }
 
 impl std::fmt::Display for OpenError {
@@ -360,6 +362,7 @@ impl std::fmt::Display for OpenError {
         match self {
             OpenError::Io(e) => write!(f, "index: {e}"),
             OpenError::Version(e) => write!(f, "index version: {e}"),
+            OpenError::Corrupt(e) => write!(f, "index corrupt: {e}"),
         }
     }
 }
@@ -688,14 +691,23 @@ struct Side {
     reader: IndexReader,
 }
 
+/// A Tantivy error on `dir`: [`OpenError::Corrupt`] when a file failed its integrity check.
+fn side_err(dir: &RoDir, e: tantivy::TantivyError) -> OpenError {
+    match dir.corrupt() {
+        Some(c) => OpenError::Corrupt(c),
+        None => e.into(),
+    }
+}
+
 fn open_side(path: &Path) -> Result<Side, OpenError> {
     let dir = RoDir::open(path).map_err(|e| OpenError::Io(e.to_string()))?;
-    let index = Index::open(dir.clone())?;
+    let index = Index::open(dir.clone()).map_err(|e| side_err(&dir, e))?;
     mailsearch_core::register(&index);
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::Manual)
-        .try_into()?;
+        .try_into()
+        .map_err(|e| side_err(&dir, e))?;
     Ok(Side { dir, index, reader })
 }
 
@@ -806,9 +818,15 @@ impl Engine {
             return Ok((self.idx, generation));
         }
         let generation = self.mail.index.load_metas()?.opstamp;
-        self.mail.reader.reload()?;
+        self.mail
+            .reader
+            .reload()
+            .map_err(|e| side_err(&self.mail.dir, e))?;
         if let Some(p) = &self.people {
-            p.side.reader.reload()?;
+            p.side
+                .reader
+                .reload()
+                .map_err(|e| side_err(&p.side.dir, e))?;
         }
         self.aff.clear();
         self.release();

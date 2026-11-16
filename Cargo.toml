@@ -21,6 +21,8 @@ unicode-normalization = "0.1"
 memmap2 = "0.9"
 stable_deref_trait = "1"
 libc = "0.2"
+# Tantivy's footer checksum (core/src/integrity.rs); the version Tantivy itself uses.
+crc32fast = "1.5"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

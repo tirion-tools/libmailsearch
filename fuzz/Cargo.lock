@@ -489,6 +489,7 @@ dependencies = [
 name = "mailsearch-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "rust-stemmers",
  "tantivy",
  "unicode-normalization",

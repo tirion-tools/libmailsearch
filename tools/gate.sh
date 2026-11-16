@@ -28,7 +28,8 @@ fuzz() {
   local t rc=0
   for t in $(cargo fuzz list --fuzz-dir fuzz); do
     mkdir -p "target/fuzz-corpus/$t" target/fuzz-findings
-    RUSTC_BOOTSTRAP=1 cargo fuzz run --fuzz-dir fuzz "$t" "target/fuzz-corpus/$t" -- \
+    # fuzz/corpus/<target>: committed regression inputs, replayed first (read-only seeds).
+    RUSTC_BOOTSTRAP=1 cargo fuzz run --fuzz-dir fuzz "$t" "target/fuzz-corpus/$t" $(ls -d "fuzz/corpus/$t" 2>/dev/null) -- \
       -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=30 -artifact_prefix="target/fuzz-findings/$t-" || rc=1
   done
   CXX=clang++-19 cmake -S cpp -B build/cpp-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMAILSEARCH_FUZZ=ON >/dev/null \

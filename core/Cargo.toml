@@ -12,5 +12,6 @@ workspace = true
 
 [dependencies]
 tantivy.workspace = true
+crc32fast.workspace = true
 rust-stemmers.workspace = true
 unicode-normalization.workspace = true
