@@ -7,12 +7,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::ops::{Deref, Range};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use tantivy::Directory;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
-    DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
+    DirectoryLock, FileHandle, FileSlice, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
 };
 
 struct MapArc(Arc<memmap2::Mmap>);
@@ -41,6 +42,32 @@ impl FileHandle for MapHandle {
             ));
         }
         Ok(OwnedBytes::new(MapArc(self.0.clone())).slice(range))
+    }
+}
+
+/// A file read with `pread` (the open check): its pages go to the page cache only, never into this
+/// process's mappings, so they do not count in its memory until a query touches them.
+#[derive(Debug)]
+struct PreadHandle {
+    f: std::fs::File,
+    len: usize,
+}
+impl tantivy::HasLen for PreadHandle {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+impl FileHandle for PreadHandle {
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+        if range.end > self.len || range.start > range.end {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past the end of an index file",
+            ));
+        }
+        let mut b = vec![0u8; range.len()];
+        self.f.read_exact_at(&mut b, range.start as u64)?;
+        Ok(OwnedBytes::new(b))
     }
 }
 
@@ -153,9 +180,17 @@ impl Directory for RoDir {
             // a reader generation may hold (lease).
             Arc::new(unsafe { memmap2::Mmap::map(&f) }.map_err(|e| read_err(p, e))?)
         };
+        // The check reads through the descriptor, not the mapping: reading the store, fast
+        // fields, fieldnorms and deletes through it kept every page mapped (76 MiB at 1M) until the
+        // first release, though a query touches few of them.
         if mailsearch_core::integrity::checked_at_open(p)
-            && let Err(e) =
-                mailsearch_core::integrity::check_file(OwnedBytes::new(MapArc(m.clone())))
+            && let Err(e) = f.try_clone().map_err(|e| e.to_string()).and_then(|f| {
+                let h = PreadHandle {
+                    f,
+                    len: len as usize,
+                };
+                mailsearch_core::integrity::check_file(FileSlice::new(Arc::new(h)))
+            })
         {
             let msg = format!("{}: {e}", p.display());
             self.corrupt

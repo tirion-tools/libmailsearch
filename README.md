@@ -87,8 +87,9 @@ needs a profile with the same setting. Consumers of the C++ part `add_subdirecto
   files a segment decodes when it opens (doc store, fast fields, field norms, delete bitset) are checked against their
   footer CRC32 when the reader first maps them (`mailsearch_core::integrity`); a mismatch fails `mailsearch_open` /
   `mailsearch_reload` with `MAILSEARCH_E_CORRUPT`. A writer calls `integrity::check_index` before it opens segments.
-  Cost: one pass over those files per mapping (no stored fields: they are a few bytes per document); term
-  dictionaries, postings and positions stay lazily paged.
+  Cost: one pass over those files per mapping (no stored fields: they are a few bytes per document), read with
+  `pread` in 64 KiB pieces rather than through the mapping, so the pages stay in the page cache and out of the
+  reader's memory until a query touches them; term dictionaries, postings and positions stay lazily paged.
 - **Known limits.** A checksum stops corruption, not a crafted index: a hostile writer can compute it, and Tantivy can
   then still abort the process. A caller that maps an index written by another process keeps a crash guard keyed on
   `mailsearch_current` (the directory to refuse after a crash inside the reader). "At most 3 typo candidates per term"

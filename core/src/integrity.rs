@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tantivy::directory::footer::Footer;
 use tantivy::directory::{FileSlice, OwnedBytes};
 use tantivy::index::SegmentComponent;
-use tantivy::{Directory, Index, SegmentMeta};
+use tantivy::{Directory, HasLen, Index, SegmentMeta};
 
 /// Components whose files are checked before a segment opens.
 const CHECKED: [SegmentComponent; 4] = [
@@ -37,12 +37,27 @@ pub fn checked_at_open(path: &Path) -> bool {
         .is_some_and(|c| CHECKED.contains(&c))
 }
 
-/// Checks the footer CRC32 of one complete index file.
-pub fn check_file(bytes: OwnedBytes) -> Result<(), String> {
-    let (footer, body) =
-        Footer::extract_footer(FileSlice::new(Arc::new(bytes))).map_err(|e| e.to_string())?;
-    let body = body.read_bytes().map_err(|e| e.to_string())?;
-    let crc = crc32fast::hash(body.as_slice());
+/// Bytes of a checked file read at a time: a reader reads them with `pread` into a buffer below
+/// glibc's mmap threshold, so the check neither maps the file nor allocates the whole body.
+const CHUNK: usize = 64 << 10;
+
+/// Checks the footer CRC32 of one complete index file, reading the body in [`CHUNK`] slices.
+pub fn check_file(file: FileSlice) -> Result<(), String> {
+    let (footer, body) = Footer::extract_footer(file).map_err(|e| e.to_string())?;
+    let mut h = crc32fast::Hasher::new();
+    let n = body.len();
+    let mut o = 0;
+    while o < n {
+        let e = (o + CHUNK).min(n);
+        h.update(
+            body.slice(o..e)
+                .read_bytes()
+                .map_err(|e| e.to_string())?
+                .as_slice(),
+        );
+        o = e;
+    }
+    let crc = h.finalize();
     if crc != footer.crc {
         return Err(format!(
             "checksum mismatch (footer {:08x}, contents {crc:08x})",
@@ -74,7 +89,8 @@ pub fn check_index(index: &Index) -> Result<(), String> {
             let bytes = dir
                 .atomic_read(&p)
                 .map_err(|e| format!("{}: {e}", p.display()))?;
-            check_file(OwnedBytes::new(bytes)).map_err(|e| format!("{}: {e}", p.display()))?;
+            check_file(FileSlice::new(Arc::new(OwnedBytes::new(bytes))))
+                .map_err(|e| format!("{}: {e}", p.display()))?;
         }
     }
     Ok(())
@@ -151,7 +167,8 @@ mod tests {
 
     #[test]
     fn short_or_footerless_files_are_refused() {
-        assert!(check_file(OwnedBytes::new(Vec::new())).is_err());
-        assert!(check_file(OwnedBytes::new(vec![0u8; 64])).is_err());
+        let file = |v: Vec<u8>| FileSlice::new(Arc::new(OwnedBytes::new(v)));
+        assert!(check_file(file(Vec::new())).is_err());
+        assert!(check_file(file(vec![0u8; 64])).is_err());
     }
 }
