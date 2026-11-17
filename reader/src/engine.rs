@@ -839,9 +839,8 @@ struct Aff {
     a: HashMap<u64, f64>,
     /// the 50 correspondents the user sent most to (address hashes)
     top50: Arc<HashSet<u64>>,
-    /// per people segment, per document: the Person's address hash, A and message count (zero for
-    /// Corr documents)
-    keys: HashMap<SegmentId, Vec<PKey>>,
+    /// per people segment: the live Person documents' address hash, A and message count
+    keys: HashMap<SegmentId, PKeys>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -849,6 +848,33 @@ struct PKey {
     addr: u64,
     a: f64,
     n: u64,
+}
+
+/// The keys of one people segment's live Person documents, in document order (Corr documents, half
+/// of the segment, have none).
+#[derive(Default)]
+struct PKeys {
+    doc: Vec<DocId>,
+    key: Vec<PKey>,
+}
+
+impl PKeys {
+    /// The key of `d` (zero if `d` has none). `at` is a cursor for lookups in increasing document
+    /// order, as a scorer visits them: a galloping search from it.
+    fn get(&self, d: DocId, at: &mut usize) -> PKey {
+        let rest = &self.doc[*at..];
+        let mut step = 1;
+        while step < rest.len() && rest[step - 1] < d {
+            step *= 2;
+        }
+        let i = *at + rest[..step.min(rest.len())].partition_point(|x| *x < d);
+        *at = i;
+        if self.doc.get(i) == Some(&d) {
+            self.key[i]
+        } else {
+            PKey::default()
+        }
+    }
 }
 
 /// A person match in rank order: `Less` is better (higher A, then more messages, then lower id).
@@ -890,14 +916,38 @@ fn affinity_of(sent: u64, replied: u64, contact: bool) -> f64 {
     a
 }
 
-/// One people segment's rows, read once from its fast fields; deletes apply when they are joined.
+/// One people segment's rows, read once from its fast fields and kept while the segment is live (a
+/// reload reads only the new segments); deletes apply when they are joined. Columns of exactly the
+/// rows' length: 28 bytes per Person and 29 per Corr document.
 #[derive(Default)]
 struct SegPeople {
-    /// Person documents: (doc, correspondents.id, address hash, account)
-    persons: Vec<(DocId, u64, u64, u64)>,
-    /// Corr documents: (doc, correspondents.id, sent, replied, message count, contact)
-    corr: Vec<(DocId, u64, u64, u64, u64, bool)>,
+    persons: Persons,
+    corr: Corrs,
 }
+
+/// Person documents: doc, correspondents.id, address hash, account.
+#[derive(Default)]
+struct Persons {
+    doc: Vec<DocId>,
+    id: Vec<u64>,
+    addr: Vec<u64>,
+    account: Vec<u64>,
+}
+
+/// Corr documents: doc, correspondents.id, sent, message count, [`REPLIED`] | [`CONTACT`].
+#[derive(Default)]
+struct Corrs {
+    doc: Vec<DocId>,
+    id: Vec<u64>,
+    sent: Vec<u64>,
+    n: Vec<u64>,
+    flags: Vec<u8>,
+}
+
+/// [`Corrs::flags`]: the user replied to the correspondent (`replied_to` > 0).
+const REPLIED: u8 = 1;
+/// [`Corrs::flags`]: the correspondent is a contact.
+const CONTACT: u8 = 2;
 
 impl SegPeople {
     /// Reads the columns in blocks: one virtual call per block and column, not per document.
@@ -924,11 +974,12 @@ impl SegPeople {
         const B: u32 = 4096;
         let mut buf = vec![vec![0u64; B as usize]; names.len()];
         let max = seg.max_doc();
+        let (p, c) = (&mut out.persons, &mut out.corr);
         let mut d0 = 0u32;
         while d0 < max {
             let k = (max - d0).min(B) as usize;
-            for (c, b) in cols.iter().zip(buf.iter_mut()) {
-                c.get_range(d0 as u64, &mut b[..k]);
+            for (cl, b) in cols.iter().zip(buf.iter_mut()) {
+                cl.get_range(d0 as u64, &mut b[..k]);
             }
             let [kind, account, id, ah, sent, rep, recv, cc, contact] = &buf[..] else {
                 unreachable!("one buffer per column")
@@ -936,15 +987,31 @@ impl SegPeople {
             for (j, &kd) in kind[..k].iter().enumerate() {
                 let d = d0 + j as u32;
                 if kd == 0 {
-                    out.persons.push((d, id[j], ah[j], account[j]));
+                    p.doc.push(d);
+                    p.id.push(id[j]);
+                    p.addr.push(ah[j]);
+                    p.account.push(account[j]);
                 } else {
-                    let n = sent[j] + recv[j] + cc[j];
-                    out.corr
-                        .push((d, id[j], sent[j], rep[j], n, contact[j] != 0));
+                    c.doc.push(d);
+                    c.id.push(id[j]);
+                    c.sent.push(sent[j]);
+                    c.n.push(sent[j] + recv[j] + cc[j]);
+                    let replied = if rep[j] > 0 { REPLIED } else { 0 };
+                    c.flags
+                        .push(replied | if contact[j] != 0 { CONTACT } else { 0 });
                 }
             }
             d0 += k as u32;
         }
+        p.doc.shrink_to_fit();
+        p.id.shrink_to_fit();
+        p.addr.shrink_to_fit();
+        p.account.shrink_to_fit();
+        c.doc.shrink_to_fit();
+        c.id.shrink_to_fit();
+        c.sent.shrink_to_fit();
+        c.n.shrink_to_fit();
+        c.flags.shrink_to_fit();
         out
     }
 }
@@ -977,33 +1044,39 @@ impl Aff {
     fn build(s: &Searcher, rows: &[Arc<SegPeople>], scope: Option<&[u64]>) -> Aff {
         let mut aff = Aff::default();
         let segs = s.segment_readers();
-        // Corr rows (id → sent, replied, message count, contact), sorted by id
-        let mut corr: Vec<(u64, u64, u64, u64, bool)> = Vec::new();
+        // Corr rows (id, sent, message count, flags), sorted by id
+        let mut corr: Vec<(u64, u64, u64, u8)> = Vec::new();
         for (seg, r) in segs.iter().zip(rows) {
             let alive = seg.alive_bitset();
+            let c = &r.corr;
             corr.extend(
-                r.corr
-                    .iter()
-                    .filter(|c| alive.is_none_or(|a| a.is_alive(c.0)))
-                    .map(|c| (c.1, c.2, c.3, c.4, c.5)),
+                (0..c.doc.len())
+                    .filter(|&i| alive.is_none_or(|a| a.is_alive(c.doc[i])))
+                    .map(|i| (c.id[i], c.sent[i], c.n[i], c.flags[i])),
             );
         }
         corr.sort_unstable_by_key(|c| c.0);
         let mut top: Vec<(u64, u64)> = Vec::new();
         for (seg, r) in segs.iter().zip(rows) {
             let alive = seg.alive_bitset();
-            let mut keys = vec![PKey::default(); seg.max_doc() as usize];
-            for &(d, id, ah, account) in &r.persons {
+            let p = &r.persons;
+            let mut keys = PKeys {
+                doc: Vec::with_capacity(p.doc.len()),
+                key: Vec::with_capacity(p.doc.len()),
+            };
+            for (i, &d) in p.doc.iter().enumerate() {
                 if !alive.is_none_or(|a| a.is_alive(d)) {
                     continue;
                 }
-                let (sent, rep, n, contact) = match corr.binary_search_by_key(&id, |c| c.0) {
-                    Ok(k) => (corr[k].1, corr[k].2, corr[k].3, corr[k].4),
-                    Err(_) => (0, 0, 0, false),
+                let (sent, n, flags) = match corr.binary_search_by_key(&p.id[i], |c| c.0) {
+                    Ok(k) => (corr[k].1, corr[k].2, corr[k].3),
+                    Err(_) => (0, 0, 0),
                 };
+                let ah = p.addr[i];
                 // outside the affinity accounts: suggestions and people-first only (A = 0)
-                let a = if scope.is_none_or(|v| v.binary_search(&account).is_ok()) {
-                    let a = affinity_of(sent, rep, contact);
+                let a = if scope.is_none_or(|v| v.binary_search(&p.account[i]).is_ok()) {
+                    let replied = u64::from(flags & REPLIED != 0);
+                    let a = affinity_of(sent, replied, flags & CONTACT != 0);
                     let e = aff.a.entry(ah).or_insert(0.0);
                     *e = e.max(a);
                     if sent > 0 {
@@ -1013,8 +1086,11 @@ impl Aff {
                 } else {
                     0.0
                 };
-                keys[d as usize] = PKey { addr: ah, a, n };
+                keys.doc.push(d);
+                keys.key.push(PKey { addr: ah, a, n });
             }
+            keys.doc.shrink_to_fit();
+            keys.key.shrink_to_fit();
             aff.keys.insert(seg.segment_id(), keys);
         }
         top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -1971,17 +2047,18 @@ impl Engine {
         if cap == 0 {
             return Ok(Vec::new());
         }
-        let none: Vec<PKey> = Vec::new();
+        let none = PKeys::default();
         for seg in s.segment_readers() {
             self.check_cancel()?;
             let id = col(seg, "id")?;
             let keys = aff.keys.get(&seg.segment_id()).unwrap_or(&none);
+            let mut at = 0;
             let alive = seg.alive_bitset();
             let mut sc = w.scorer(seg, 1.0)?;
             let mut d = sc.doc();
             while d != TERMINATED {
                 if alive.is_none_or(|a| a.is_alive(d)) {
-                    let k = keys.get(d as usize).copied().unwrap_or_default();
+                    let k = keys.get(d, &mut at);
                     let r = PRank {
                         a: if by_affinity { k.a } else { 0.0 },
                         n: k.n,
@@ -2150,22 +2227,26 @@ impl Engine {
                 if qhit.is_empty() {
                     continue;
                 }
-                // (2) conversation members in the query's scope; probe list: (segment, doc,
-                // Some(qhit index) | None, conv)
+                // (2) the conversations with a member in the query's scope that matches outside
+                // quoted text: one walk of (conversation ∧ non-quoted clause ∧ filters), so the
+                // members themselves are never listed (a large thread has thousands)
                 let qconv: Vec<u64> = qhit.iter().map(|(k, _)| cands[*k].conv).collect();
                 let want: HashSet<u64> = qconv.iter().copied().filter(|c| *c != 0).collect();
-                let mut probe: Vec<(u32, DocId, Option<usize>, u64)> = Vec::new();
+                let mut conv_nq: HashSet<u64> = HashSet::new();
                 if !want.is_empty() {
-                    let mut must: Vec<(Occur, Box<dyn TQuery>)> = vec![(
-                        Occur::Must,
-                        Box::new(TermSetQuery::new(
-                            want.iter().map(|c| Term::from_field_u64(self.f.conv, *c)),
-                        )),
-                    )];
+                    let mut must: Vec<(Occur, Box<dyn TQuery>)> = vec![
+                        (
+                            Occur::Must,
+                            Box::new(TermSetQuery::new(
+                                want.iter().map(|c| Term::from_field_u64(self.f.conv, *c)),
+                            )),
+                        ),
+                        (Occur::Must, self.term_q(t, ALL, o, Sel::NonQuoted)),
+                    ];
                     must.extend(self.filter_qs(fl));
-                    let mq = BooleanQuery::new(must);
-                    let wm = mq.weight(EnableScoring::disabled_from_searcher(searcher))?;
-                    for (so, seg) in segs.iter().enumerate() {
+                    let wm = BooleanQuery::new(must)
+                        .weight(EnableScoring::disabled_from_searcher(searcher))?;
+                    for seg in segs {
                         let convc = col(seg, "conv")?;
                         let excl = bits
                             .as_ref()
@@ -2177,49 +2258,36 @@ impl Engine {
                             if alive.is_none_or(|a| a.is_alive(d))
                                 && excl.as_ref().is_none_or(|b| !b.contains(d))
                             {
-                                probe.push((so as u32, d, None, convc.get_val(d)));
+                                conv_nq.insert(convc.get_val(d));
                             }
                             d = sc.advance();
                         }
                     }
                 }
-                probe.extend(qhit.iter().enumerate().map(|(j, (k, _))| {
-                    (
-                        cands[*k].addr.segment_ord,
-                        cands[*k].addr.doc_id,
-                        Some(j),
-                        qconv[j],
-                    )
-                }));
-                probe.sort_unstable_by_key(|x| (x.0, x.1, x.2.is_some()));
-                // (3) one walk of the non-quoted clause
-                let wn = self
-                    .term_q(t, ALL, o, Sel::NonQuoted)
-                    .weight(EnableScoring::disabled_from_searcher(searcher))?;
-                let mut nq_hit = vec![false; qhit.len()];
-                let mut conv_nq: HashSet<u64> = HashSet::new();
-                let mut i = 0;
-                while i < probe.len() {
-                    let so = probe[i].0;
-                    let mut sn = wn.scorer(&segs[so as usize], 1.0)?;
-                    while i < probe.len() && probe[i].0 == so {
-                        let (_, d, j, cv) = probe[i];
-                        if sn.doc() < d {
-                            sn.seek(d);
-                        }
-                        if sn.doc() == d {
-                            match j {
-                                Some(j) => nq_hit[j] = true,
-                                None => {
-                                    conv_nq.insert(cv);
-                                }
-                            }
-                        }
-                        i += 1;
-                    }
+                // (3) a candidate in a conversation is in scope itself (collected under the same
+                // filters, live, not excluded), so it matches outside quoted text only if its
+                // conversation is in `conv_nq`; a candidate without one is checked alone
+                let alone: Vec<DocAddress> = qhit
+                    .iter()
+                    .zip(&qconv)
+                    .filter(|(_, c)| **c == 0)
+                    .map(|((k, _), _)| cands[*k].addr)
+                    .collect();
+                let mut nq_alone = Vec::new();
+                if !alone.is_empty() {
+                    let wn = self
+                        .term_q(t, ALL, o, Sel::NonQuoted)
+                        .weight(EnableScoring::disabled_from_searcher(searcher))?;
+                    nq_alone = Self::matches(searcher, &*wn, &alone)?;
                 }
+                let mut nq_alone = nq_alone.into_iter();
                 for (j, (k, s)) in qhit.iter().enumerate() {
-                    if nq_hit[j] || (qconv[j] != 0 && conv_nq.contains(&qconv[j])) {
+                    let nq = if qconv[j] == 0 {
+                        nq_alone.next() == Some(true)
+                    } else {
+                        conv_nq.contains(&qconv[j])
+                    };
+                    if nq {
                         continue;
                     }
                     extra[*k] += mult * *s;
