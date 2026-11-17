@@ -43,7 +43,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 use tantivy::columnar::ColumnValues;
 use tantivy::index::SegmentId;
@@ -65,6 +65,9 @@ pub const CANCEL_EVERY: u32 = 4096;
 /// People-first resolution sorts only this many of the matching people before taking the top 5
 /// distinct sender addresses (all of them when these share fewer than 5 addresses).
 const PEOPLE_FIRST_SCAN: usize = 64;
+/// People suggestions of a one-letter prefix kept per first character ([`FirstTop`]): the desktop asks for 8
+/// (desktop/search/search_session.cc); a larger cap runs the query.
+const FIRST_TOP: usize = 8;
 
 // MAILSEARCH_F_* (clause fields) and MAILSEARCH_T_* (tiers), as in mailsearch.h.
 pub const F_SUBJECT: u32 = 1 << 0;
@@ -1019,6 +1022,8 @@ struct Aff {
     top50: Arc<KeySet>,
     /// per people segment: the live Person documents' address hash, A and message count
     keys: HashMap<SegmentId, PKeys>,
+    /// the suggestions of every one-letter prefix by this affinity, set after it on its build thread
+    first: OnceLock<FirstTop>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1040,6 +1045,11 @@ impl PKeys {
     /// The key of `d` (zero if `d` has none). `at` is a cursor for lookups in increasing document
     /// order, as a scorer visits them: a galloping search from it.
     fn get(&self, d: DocId, at: &mut usize) -> PKey {
+        self.find(d, at).unwrap_or_default()
+    }
+
+    /// The key of `d` if `d` is a live Person document; `at` as for [`PKeys::get`].
+    fn find(&self, d: DocId, at: &mut usize) -> Option<PKey> {
         let rest = &self.doc[*at..];
         let mut step = 1;
         while step < rest.len() && rest[step - 1] < d {
@@ -1047,12 +1057,122 @@ impl PKeys {
         }
         let i = *at + rest[..step.min(rest.len())].partition_point(|x| *x < d);
         *at = i;
-        if self.doc.get(i) == Some(&d) {
-            self.key[i]
-        } else {
-            PKey::default()
-        }
+        (self.doc.get(i) == Some(&d)).then(|| self.key[i])
     }
+}
+
+/// People suggestions of every one-letter prefix, the first keystroke of each word: one letter matches nearly
+/// every person (`c`: every `.com` address), so the query read most of the people index each time (1M: p95
+/// 10 ms, against 0.4 ms from 3 letters). Per first character of a `names` term, the best [`FIRST_TOP`]
+/// Person ids in [`PRank`] order by affinity, as [`Engine::people`] ranks them; built from one walk of the
+/// term dictionary (terms with the same first character are adjacent) after the affinity it ranks by.
+#[derive(Default)]
+struct FirstTop(HashMap<char, Vec<u64>>);
+
+impl FirstTop {
+    /// `None` when `stop` was set (a reload or a scope change no longer needs it).
+    fn build(
+        s: &Searcher,
+        names: Field,
+        aff: &Aff,
+        stop: &AtomicBool,
+    ) -> tantivy::Result<Option<FirstTop>> {
+        let mut best: HashMap<char, BinaryHeap<PRank>> = HashMap::new();
+        let none = PKeys::default();
+        for seg in s.segment_readers() {
+            let keys = aff.keys.get(&seg.segment_id()).unwrap_or(&none);
+            if keys.doc.is_empty() {
+                continue;
+            }
+            let id = col(seg, "id")?;
+            let inv = seg.inverted_index(names)?;
+            let mut strm = inv.terms().stream()?;
+            // the documents of the terms starting with `cur`
+            let mut cur: Option<char> = None;
+            let mut bits = BitSet::with_max_value(seg.max_doc());
+            let mut flush = |c: char, bits: BitSet| {
+                let heap = best.entry(c).or_default();
+                let mut docs = BitSetDocSet::from(bits);
+                let mut at = 0;
+                let mut d = docs.doc();
+                while d != TERMINATED {
+                    if let Some(k) = keys.find(d, &mut at) {
+                        let r = PRank {
+                            a: k.a,
+                            n: k.n,
+                            id: id.get_val(d),
+                            addr: k.addr,
+                        };
+                        if heap.len() < FIRST_TOP {
+                            heap.push(r);
+                        } else if heap.peek().is_some_and(|w| r < *w) {
+                            heap.pop();
+                            heap.push(r);
+                        }
+                    }
+                    d = docs.advance();
+                }
+            };
+            loop {
+                let more = strm.advance();
+                let c = if more { first_char(strm.key()) } else { None };
+                if c != cur || !more {
+                    if let Some(p) = cur {
+                        flush(
+                            p,
+                            std::mem::replace(&mut bits, BitSet::with_max_value(seg.max_doc())),
+                        );
+                        if stop.load(Ordering::Relaxed) {
+                            return Ok(None);
+                        }
+                    }
+                    cur = c;
+                }
+                if !more {
+                    break;
+                }
+                if c.is_none() {
+                    continue;
+                }
+                let mut p =
+                    inv.read_block_postings_from_terminfo(strm.value(), IndexRecordOption::Basic)?;
+                loop {
+                    let docs = p.docs();
+                    if docs.is_empty() {
+                        break;
+                    }
+                    for &d in docs {
+                        bits.insert(d);
+                    }
+                    p.advance();
+                }
+            }
+        }
+        Ok(Some(FirstTop(
+            best.into_iter()
+                .map(|(c, h)| (c, h.into_sorted_vec().into_iter().map(|r| r.id).collect()))
+                .collect(),
+        )))
+    }
+
+    /// The best `cap` (≤ [`FIRST_TOP`]) ids for the one-letter prefix `c`.
+    fn get(&self, c: char, cap: usize) -> Vec<u64> {
+        self.0
+            .get(&c)
+            .map(|v| v[..cap.min(v.len())].to_vec())
+            .unwrap_or_default()
+    }
+}
+
+/// The first character of a term (`None`: not UTF-8 there).
+fn first_char(term: &[u8]) -> Option<char> {
+    let n = match *term.first()? {
+        b if b < 0x80 => 1,
+        b if b < 0xE0 => 2,
+        b if b < 0xF0 => 3,
+        _ => 4,
+    };
+    std::str::from_utf8(term.get(..n)?).ok()?.chars().next()
 }
 
 /// A person match in rank order: `Less` is better (higher A, then more messages, then lower id).
@@ -1279,6 +1399,15 @@ impl Aff {
     }
 }
 
+/// [`Engine::start_affinity`]'s thread: it sends the affinity, then builds its [`FirstTop`] (until `stop`).
+struct AffJob {
+    scope: Option<Vec<u64>>,
+    /// `None` once the affinity was received
+    rx: Option<mpsc::Receiver<Arc<Aff>>>,
+    stop: Arc<AtomicBool>,
+    h: std::thread::JoinHandle<()>,
+}
+
 // ---- engine -------------------------------------------------------------------------------------
 
 pub struct Engine {
@@ -1298,7 +1427,7 @@ pub struct Engine {
     aff_accounts: Option<Vec<u64>>,
     /// the affinity build of the loaded people generation for a scope, started at open and after a
     /// reload that changed the people index ([`Engine::start_affinity`])
-    aff_job: Option<(Option<Vec<u64>>, std::thread::JoinHandle<Aff>)>,
+    aff_job: Option<AffJob>,
     /// people rows per segment (segments are immutable): a reload reads only the new segments
     people_rows: Arc<Mutex<HashMap<SegmentId, Arc<SegPeople>>>>,
     cancel: Arc<AtomicBool>,
@@ -1366,9 +1495,11 @@ impl Engine {
     /// pages of the old mapping. Returns the lease `(dir, gen)` to report as ReaderAt; `gen` is read
     /// before reloading, so the reader holds nothing older than it.
     pub fn reload(&mut self) -> Result<(u32, u64), OpenError> {
-        // a running build holds the previous generation's segments
-        self.join_affinity();
+        // the affinity of the loaded people generation; its FirstTop goes on while that generation stays
+        self.take_affinity();
         if read_current(&self.root).is_some_and(|n| n != self.idx) {
+            // a running build holds the previous generation's segments
+            self.join_affinity();
             let mut e = Engine::open_dir(&self.root)?;
             let generation = e.mail.index.load_metas()?.opstamp;
             e.excluded = self.excluded.take();
@@ -1429,30 +1560,67 @@ impl Engine {
 
     /// Starts the affinity build of the loaded people generation for the current scope on a
     /// background thread: the people scan (75–90 ms at 1M) then runs between an open or reload
-    /// and the first query, which joins it. Without a thread the first query builds it.
+    /// and the first query, which waits for it. Without a thread the first query builds it (and
+    /// one-letter suggestions run the query). The thread then builds the affinity's [`FirstTop`].
     fn start_affinity(&mut self) {
         self.join_affinity();
         let Some(p) = &self.people else {
             return;
         };
         let s = p.side.reader.searcher();
+        let names = p.f.names;
         let rows = self.people_rows.clone();
         let scope = self.aff_accounts.clone();
         let sc = scope.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = stop.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
         if let Ok(h) = std::thread::Builder::new()
             .name("mailsearch-affinity".into())
-            .spawn(move || Aff::of(&s, &rows, sc.as_deref()))
+            .spawn(move || {
+                let aff = Arc::new(Aff::of(&s, &rows, sc.as_deref()));
+                if tx.send(aff.clone()).is_err() {
+                    return;
+                }
+                // a read error leaves the one-letter suggestions to the query
+                if let Ok(Some(f)) = FirstTop::build(&s, names, &aff, &st) {
+                    let _ = aff.first.set(f);
+                }
+            })
         {
-            self.aff_job = Some((scope, h));
+            self.aff_job = Some(AffJob {
+                scope,
+                rx: Some(rx),
+                stop,
+                h,
+            });
         }
     }
 
-    /// Waits for a running affinity build and keeps its result. A panic in the build is resumed
-    /// on this thread (the C ABI's catch boundary).
+    /// Waits for the affinity of a running build and keeps it (its [`FirstTop`] may still be
+    /// building). A panic in the build is resumed on this thread (the C ABI's catch boundary).
+    fn take_affinity(&mut self) {
+        let Some(j) = &mut self.aff_job else {
+            return;
+        };
+        let Some(rx) = j.rx.take() else {
+            return;
+        };
+        match rx.recv() {
+            Ok(a) => {
+                self.aff.entry(j.scope.clone()).or_insert(a);
+            }
+            Err(_) => self.join_affinity(),
+        }
+    }
+
+    /// Takes the affinity of a running build, stops its [`FirstTop`] and joins the thread (it holds
+    /// the generation's segments).
     fn join_affinity(&mut self) {
-        if let Some((scope, h)) = self.aff_job.take() {
-            let a = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-            self.aff.entry(scope).or_insert_with(|| Arc::new(a));
+        self.take_affinity();
+        if let Some(j) = self.aff_job.take() {
+            j.stop.store(true, Ordering::Relaxed);
+            j.h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
         }
     }
 
@@ -2246,9 +2414,9 @@ impl Engine {
         if self
             .aff_job
             .as_ref()
-            .is_some_and(|j| j.0 == self.aff_accounts)
+            .is_some_and(|j| j.scope == self.aff_accounts)
         {
-            self.join_affinity();
+            self.take_affinity();
         }
         if let Some(a) = self.aff.get(&self.aff_accounts) {
             return a.clone();
@@ -2399,6 +2567,16 @@ impl Engine {
         if toks.is_empty() || cap == 0 {
             return Ok(Vec::new());
         }
+        let aff = self.affinity();
+        if let [t] = &toks[..]
+            && cap <= FIRST_TOP
+            && let Some(f) = aff.first.get()
+        {
+            let mut cs = t.chars();
+            if let (Some(c), None) = (cs.next(), cs.next()) {
+                return Ok(f.get(c, cap));
+            }
+        }
         let last = toks.len() - 1;
         let subs: Vec<(Occur, Box<dyn TQuery>)> = toks
             .iter()
@@ -2413,7 +2591,6 @@ impl Engine {
                 (Occur::Must, q)
             })
             .collect();
-        let aff = self.affinity();
         Ok(self
             .people_match(Box::new(BooleanQuery::new(subs)), &aff, true, Some(cap))?
             .into_iter()

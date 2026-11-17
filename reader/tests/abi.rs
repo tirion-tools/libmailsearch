@@ -849,6 +849,47 @@ fn people_suggestions_and_owner() {
 }
 
 #[test]
+fn people_one_letter() {
+    let fx = fixture();
+    let g = open(&fx.root).unwrap();
+    let people = |p: &str, cap: usize| -> Vec<u64> {
+        let mut ids = vec![0u64; cap];
+        // SAFETY: valid pointers.
+        let n = unsafe {
+            mailsearch_people(
+                g,
+                p.as_ptr() as *const c_char,
+                p.len(),
+                ids.as_mut_ptr(),
+                ids.len(),
+            )
+        };
+        assert!(n >= 0);
+        ids.truncate(n as usize);
+        ids
+    };
+    // the per-letter table is built after the affinity, on its thread; a cap above 8 always runs the query
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for (p, want) in [
+        ("a", vec![100, 102]),
+        ("A", vec![100, 102]),
+        ("b", vec![101, 102]),
+        ("e", vec![100, 101, 102]),
+        ("c", vec![100]),
+        ("z", vec![]),
+    ] {
+        assert_eq!(people(p, 8), want, "{p}");
+        assert_eq!(people(p, 9), want, "{p} through the query");
+        assert_eq!(people(p, 1), want[..want.len().min(1)], "{p} cap 1");
+    }
+    for c in ('a'..='z').chain('0'..='9') {
+        let p = c.to_string();
+        assert_eq!(people(&p, 8), people(&p, 9), "{p}");
+    }
+    close(g);
+}
+
+#[test]
 fn highlight_spans() {
     let fx = fixture();
     let g = open(&fx.root).unwrap();
