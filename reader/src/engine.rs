@@ -48,9 +48,9 @@ use std::time::Instant;
 use tantivy::columnar::ColumnValues;
 use tantivy::index::SegmentId;
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EnableScoring, FuzzyTermQuery, Occur,
-    PhrasePrefixQuery, PhraseQuery, Query as TQuery, RangeQuery, Scorer, TermQuery, TermSetQuery,
-    Weight,
+    AllQuery, BitSetDocSet, BooleanQuery, BoostQuery, ConstScoreQuery, ConstScorer, EnableScoring,
+    Explanation, FuzzyTermQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query as TQuery,
+    RangeQuery, Scorer, TermQuery, TermSetQuery, Weight,
 };
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::tokenizer::TextAnalyzer;
@@ -435,6 +435,8 @@ impl std::hash::Hasher for IdHasher {
     }
 }
 pub type KeySet = HashSet<u64, std::hash::BuildHasherDefault<IdHasher>>;
+/// A map keyed by ids or hashes ([`IdHasher`]).
+pub type KeyMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
 
 #[derive(Clone, Copy, Debug)]
 struct Cand {
@@ -498,7 +500,7 @@ impl Ord for Cand {
 /// skipped once `cap` newer hits are held and `count_need` matches are counted.
 struct Coll {
     cap: usize,
-    extra: Option<Arc<HashSet<u64>>>,
+    extra: Option<Arc<KeySet>>,
     scoring: bool,
     bits: Option<Arc<HashMap<SegmentId, Arc<BitSet>>>>,
     collapse: bool,
@@ -550,18 +552,23 @@ fn col(seg: &tantivy::SegmentReader, name: &str) -> tantivy::Result<Arc<dyn Colu
 }
 
 impl SegCols {
-    fn new(seg: &tantivy::SegmentReader) -> tantivy::Result<SegCols> {
+    fn new(e: &Engine, seg: &tantivy::SegmentReader) -> tantivy::Result<SegCols> {
         Ok(SegCols {
-            skey: col(seg, "skey")?,
-            mid: col(seg, "mid")?,
-            from: col(seg, "from_h")?,
-            bulk: col(seg, "bulk")?,
-            conv: col(seg, "conv")?,
-            dup_mid: col(seg, "dup_mid")?,
-            dup_body: col(seg, "dup_body")?,
+            skey: e.col(seg, "skey")?,
+            mid: e.col(seg, "mid")?,
+            from: e.col(seg, "from_h")?,
+            bulk: e.col(seg, "bulk")?,
+            conv: e.col(seg, "conv")?,
+            dup_mid: e.col(seg, "dup_mid")?,
+            dup_body: e.col(seg, "dup_body")?,
         })
     }
 }
+
+/// Column readers per (segment, fast field) of the loaded segments, mail and people: opening a column
+/// decodes its header, and every pass of every keystroke opened seven per segment (8 % of a 1M typing
+/// session's instructions).
+type ColCache = Mutex<HashMap<(SegmentId, &'static str), Arc<dyn ColumnValues<u64>>>>;
 
 impl Coll {
     #[inline]
@@ -572,40 +579,63 @@ impl Coll {
             && acc.heap.peek().is_some_and(|m| max < m.skey)
     }
 
+    /// Counts `doc` and keeps it where it belongs. A column is read only when needed: most matches of a
+    /// broad query are older than every kept one once the heap is full and the distinct keys are counted
+    /// to the cap, and need only their search_key.
     #[inline]
     fn collect(&self, acc: &mut Acc, c: &SegCols, ord: u32, doc: DocId, score: f32) {
         acc.count += 1;
-        let mid = c.mid.get_val(doc);
-        let (dup_mid, dup_body) = (c.dup_mid.get_val(doc), c.dup_body.get_val(doc));
-        if self.collapse && acc.distinct < self.key_cap && acc.keys.insert(dup_mid, dup_body) {
-            acc.distinct += 1;
+        let mut dup = None;
+        if self.collapse && acc.distinct < self.key_cap {
+            let (dm, db) = (c.dup_mid.get_val(doc), c.dup_body.get_val(doc));
+            dup = Some((dm, db));
+            if acc.keys.insert(dm, db) {
+                acc.distinct += 1;
+            }
         }
         let skey = c.skey.get_val(doc);
-        let mk = || Cand {
+        let from = self.extra.as_ref().map(|_| c.from.get_val(doc));
+        let to_extra = self
+            .extra
+            .as_ref()
+            .zip(from)
+            .is_some_and(|(x, f)| x.contains(&f));
+        let room = acc.heap.len() < self.cap;
+        // the oldest kept match's search_key, when the heap is full
+        let min = if room {
+            None
+        } else {
+            acc.heap.peek().map(|m| (m.skey, m.mid))
+        };
+        if !room && !to_extra && min.is_none_or(|(ms, _)| skey < ms) {
+            return;
+        }
+        let mid = c.mid.get_val(doc);
+        let to_heap = room || min.is_some_and(|m| (skey, mid) > m);
+        if !to_heap && !to_extra {
+            return;
+        }
+        let (dup_mid, dup_body) =
+            dup.unwrap_or_else(|| (c.dup_mid.get_val(doc), c.dup_body.get_val(doc)));
+        let cand = Cand {
             skey,
             mid,
             score,
-            from_h: c.from.get_val(doc),
+            from_h: from.unwrap_or_else(|| c.from.get_val(doc)),
             bulk: c.bulk.get_val(doc) != 0,
             conv: c.conv.get_val(doc),
             dup_mid,
             dup_body,
             addr: DocAddress::new(ord, doc),
         };
-        if let Some(x) = &self.extra
-            && x.contains(&c.from.get_val(doc))
-        {
-            acc.ex.push(mk());
+        if to_extra {
+            acc.ex.push(cand);
         }
-        if acc.heap.len() < self.cap {
-            acc.heap.push(mk());
-        } else if acc
-            .heap
-            .peek()
-            .is_some_and(|m| (skey, mid) > (m.skey, m.mid))
-        {
-            acc.heap.pop();
-            acc.heap.push(mk());
+        if to_heap {
+            if !room {
+                acc.heap.pop();
+            }
+            acc.heap.push(cand);
         }
     }
 }
@@ -704,6 +734,154 @@ struct Filters {
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
+}
+
+// ---- prefix tier --------------------------------------------------------------------------------
+
+/// Search calls a prefix expansion is kept for after its last use ([`PrefixCache`]): a keystroke makes three
+/// (date list, Top hits, People suggestions), and the pause query after the last one reuses its last word.
+const PREFIX_KEEP: u64 = 3;
+
+/// The documents of the terms starting with a prefix, per (segment, field, prefix), for the last
+/// [`PREFIX_KEEP`] search calls: a keystroke's date pass, Top hits pass and the walk for the top-50
+/// correspondents ask for the same expansions, which cost 42 % of a 1M typing session's instructions when each
+/// pass walked the term dictionary and read every matching term's postings again. Cleared by
+/// [`Engine::release`] (and with it at every reload).
+#[derive(Default)]
+struct PrefixCache {
+    m: Mutex<PrefixMap>,
+}
+
+#[derive(Default)]
+struct PrefixMap {
+    /// search calls so far
+    tick: u64,
+    /// (segment, field, prefix) → (tick of the last use, documents)
+    e: HashMap<PrefixKey, (u64, Arc<BitSet>)>,
+}
+
+type PrefixKey = (SegmentId, Field, Box<str>);
+
+impl PrefixCache {
+    /// A new search call: forgets the expansions not used in the last [`PREFIX_KEEP`] calls.
+    fn tick(&self) {
+        let mut m = self.m.lock().unwrap_or_else(|e| e.into_inner());
+        m.tick += 1;
+        let t = m.tick;
+        m.e.retain(|_, v| v.0 + PREFIX_KEEP >= t);
+    }
+
+    fn clear(&self) {
+        self.m.lock().unwrap_or_else(|e| e.into_inner()).e.clear();
+    }
+
+    /// The documents of `seg` with a term of `field` starting with `prefix`.
+    fn docs(
+        &self,
+        seg: &tantivy::SegmentReader,
+        field: Field,
+        prefix: &str,
+    ) -> tantivy::Result<Arc<BitSet>> {
+        let k = (seg.segment_id(), field, Box::<str>::from(prefix));
+        {
+            let mut m = self.m.lock().unwrap_or_else(|e| e.into_inner());
+            let t = m.tick;
+            if let Some(v) = m.e.get_mut(&k) {
+                v.0 = t;
+                return Ok(v.1.clone());
+            }
+        }
+        let mut bits = BitSet::with_max_value(seg.max_doc());
+        let inv = seg.inverted_index(field)?;
+        let lo = prefix.as_bytes();
+        let hi = prefix_end(lo);
+        let range = inv.terms().range().ge(lo);
+        let mut strm = match &hi {
+            Some(h) => range.lt(h).into_stream()?,
+            None => range.into_stream()?,
+        };
+        while strm.advance() {
+            let mut p =
+                inv.read_block_postings_from_terminfo(strm.value(), IndexRecordOption::Basic)?;
+            loop {
+                let docs = p.docs();
+                if docs.is_empty() {
+                    break;
+                }
+                for &d in docs {
+                    bits.insert(d);
+                }
+                p.advance();
+            }
+        }
+        let bits = Arc::new(bits);
+        let mut m = self.m.lock().unwrap_or_else(|e| e.into_inner());
+        let t = m.tick;
+        m.e.insert(k, (t, bits.clone()));
+        Ok(bits)
+    }
+}
+
+/// The smallest byte string greater than every string starting with `p` (`None`: no bound).
+fn prefix_end(p: &[u8]) -> Option<Vec<u8>> {
+    let mut v = p.to_vec();
+    while let Some(b) = v.pop() {
+        if b < 0xFF {
+            v.push(b + 1);
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Every term of `field` starting with `prefix`, at a constant score (the boost), as Tantivy's distance-0 prefix
+/// `FuzzyTermQuery` matches (its automaton accepts exactly the terms that start with the prefix), through
+/// [`PrefixCache`].
+#[derive(Clone)]
+struct PrefixQuery {
+    field: Field,
+    prefix: String,
+    cache: Arc<PrefixCache>,
+}
+
+impl std::fmt::Debug for PrefixQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PrefixQuery({:?}, {:?})", self.field, self.prefix)
+    }
+}
+
+impl TQuery for PrefixQuery {
+    fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl Weight for PrefixQuery {
+    fn scorer(
+        &self,
+        seg: &tantivy::SegmentReader,
+        boost: tantivy::Score,
+    ) -> tantivy::Result<Box<dyn Scorer>> {
+        let bits = self.cache.docs(seg, self.field, &self.prefix)?;
+        Ok(Box::new(ConstScorer::new(
+            BitSetDocSet::from((*bits).clone()),
+            boost,
+        )))
+    }
+
+    fn explain(&self, seg: &tantivy::SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        if self
+            .cache
+            .docs(seg, self.field, &self.prefix)?
+            .contains(doc)
+        {
+            Ok(Explanation::new("PrefixQuery", 1.0))
+        } else {
+            Err(tantivy::TantivyError::InvalidArgument(
+                "Document does not exist".to_string(),
+            ))
+        }
+    }
 }
 
 // ---- people and affinity ------------------------------------------------------------------------
@@ -836,9 +1014,9 @@ struct People {
 #[derive(Default)]
 struct Aff {
     /// sender address hash → A
-    a: HashMap<u64, f64>,
+    a: KeyMap<f64>,
     /// the 50 correspondents the user sent most to (address hashes)
-    top50: Arc<HashSet<u64>>,
+    top50: Arc<KeySet>,
     /// per people segment: the live Person documents' address hash, A and message count
     keys: HashMap<SegmentId, PKeys>,
 }
@@ -1114,7 +1292,7 @@ pub struct Engine {
     zones: HashMap<SegmentId, Arc<(Vec<u64>, u64)>>,
     excluded: Option<Arc<KeySet>>,
     bits: Arc<HashMap<SegmentId, Arc<BitSet>>>,
-    owner: HashSet<u64>,
+    owner: KeySet,
     /// affinity per account scope (`None` = every account), for the loaded people generation
     aff: HashMap<Option<Vec<u64>>, Arc<Aff>>,
     aff_accounts: Option<Vec<u64>>,
@@ -1126,6 +1304,8 @@ pub struct Engine {
     cancel: Arc<AtomicBool>,
     /// a [`Engine::prefetch`] thread is running
     prefetching: Arc<AtomicBool>,
+    cols: ColCache,
+    pfx: Arc<PrefixCache>,
 }
 
 impl Engine {
@@ -1165,13 +1345,15 @@ impl Engine {
             zones: HashMap::new(),
             excluded: None,
             bits: Arc::new(HashMap::new()),
-            owner: HashSet::new(),
+            owner: KeySet::default(),
             aff: HashMap::new(),
             aff_accounts: None,
             aff_job: None,
             people_rows: Arc::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             prefetching: Arc::new(AtomicBool::new(false)),
+            cols: Default::default(),
+            pfx: Default::default(),
         })
     }
 
@@ -1214,6 +1396,28 @@ impl Engine {
                 .map_err(|e| side_err(&p.side.dir, e))?;
             people_changed = *p.side.reader.searcher().generation().segments() != before;
         }
+        let mut live: HashSet<SegmentId> = self
+            .mail
+            .reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|s| s.segment_id())
+            .collect();
+        if let Some(p) = &self.people {
+            live.extend(
+                p.side
+                    .reader
+                    .searcher()
+                    .segment_readers()
+                    .iter()
+                    .map(|s| s.segment_id()),
+            );
+        }
+        self.cols
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _), _| live.contains(id));
         self.release();
         // the affinity depends on the people index only: a commit of mail alone keeps it
         if people_changed {
@@ -1252,8 +1456,27 @@ impl Engine {
         }
     }
 
+    /// The reader of fast field `name` of `seg`, from [`ColCache`].
+    fn col(
+        &self,
+        seg: &tantivy::SegmentReader,
+        name: &'static str,
+    ) -> tantivy::Result<Arc<dyn ColumnValues<u64>>> {
+        let k = (seg.segment_id(), name);
+        if let Some(c) = self.cols.lock().unwrap_or_else(|e| e.into_inner()).get(&k) {
+            return Ok(c.clone());
+        }
+        let c = col(seg, name)?;
+        self.cols
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(k, c.clone());
+        Ok(c)
+    }
+
     /// `madvise(MADV_DONTNEED)` every mapping, then (glibc) `malloc_trim`. Returns the bytes advised.
     pub fn release(&self) -> u64 {
+        self.pfx.clear();
         let n = self.mail.dir.advise_all()
             + self
                 .people
@@ -1417,10 +1640,65 @@ impl Engine {
             EnableScoring::disabled_from_searcher(searcher)
         };
         let weight = query.weight(es)?;
+        let (mut acc, skipped, full) = self.walk(searcher, &*weight, coll, None)?;
+        // the top-50 correspondents' matches anywhere (the walk may have skipped some): the walk already
+        // collected them in the segments it read whole, so only the others are walked again
+        if skipped && let Some(x) = &coll.extra {
+            let addrs: Vec<u64> = x.iter().copied().collect();
+            let q2 = BooleanQuery::new(vec![
+                (Occur::Must, query.box_clone()),
+                (Occur::Must, self.sender_filter(&addrs)),
+            ]);
+            let c2 = Coll {
+                cap: 0,
+                extra: Some(x.clone()),
+                scoring: coll.scoring,
+                bits: coll.bits.clone(),
+                collapse: false,
+                key_cap: 0,
+                early: false,
+                count_need: 0,
+            };
+            let rest: Vec<bool> = full.iter().map(|f| !f).collect();
+            let w2 = q2.weight(es)?;
+            let (a2, _, _) = self.walk(searcher, &*w2, &c2, Some(&rest))?;
+            // segment order, documents ascending, as one walk of every segment collects them
+            let mut by_seg: Vec<Vec<Cand>> = vec![Vec::new(); full.len()];
+            for c in acc.ex.into_iter().chain(a2.ex) {
+                by_seg[c.addr.segment_ord as usize].push(c);
+            }
+            acc.ex = by_seg.into_iter().flatten().collect();
+        }
+        let distinct = if coll.collapse {
+            acc.distinct
+        } else {
+            acc.count
+        };
+        let mut newest = acc.heap.into_vec();
+        newest.sort_unstable_by(|a, b| b.skey.cmp(&a.skey).then(b.mid.cmp(&a.mid)));
+        Ok(Fruit {
+            count: acc.count,
+            distinct,
+            newest,
+            extra: acc.ex,
+            skipped,
+        })
+    }
+
+    /// The walk of [`Engine::run`] over the segments (only those `only` marks, when given): the accumulator,
+    /// whether it skipped segments or blocks, and per segment whether it read every match.
+    fn walk(
+        &self,
+        searcher: &Searcher,
+        weight: &dyn Weight,
+        coll: &Coll,
+        only: Option<&[bool]>,
+    ) -> SResult<(Acc, bool, Vec<bool>)> {
         let segs = searcher.segment_readers();
         let mut order: Vec<(u64, usize)> = segs
             .iter()
             .enumerate()
+            .filter(|(i, _)| only.is_none_or(|o| o[*i]))
             .map(|(i, s)| {
                 let m = if coll.early {
                     self.zones
@@ -1438,6 +1716,7 @@ impl Engine {
         }
         let mut acc = Acc::default();
         let mut skipped = false;
+        let mut full = vec![false; segs.len()];
         for (smax, i) in order {
             self.check_cancel()?;
             let seg = &segs[i];
@@ -1445,7 +1724,7 @@ impl Engine {
                 skipped = true;
                 continue;
             }
-            let cols = SegCols::new(seg)?;
+            let cols = SegCols::new(self, seg)?;
             let z = if coll.early {
                 self.zones.get(&seg.segment_id()).cloned()
             } else {
@@ -1460,6 +1739,7 @@ impl Engine {
             let mut sc = weight.scorer(seg, 1.0)?;
             let mut doc = sc.doc();
             let mut visited = 0u32;
+            let mut whole = true;
             while doc != TERMINATED {
                 visited += 1;
                 if visited.is_multiple_of(CANCEL_EVERY) {
@@ -1469,6 +1749,7 @@ impl Engine {
                     let b = (doc / ZONE) as usize;
                     if coll.can_skip(&acc, z.0[b]) {
                         skipped = true;
+                        whole = false;
                         let next = (b as u32 + 1) * ZONE;
                         if next >= max_doc {
                             break;
@@ -1485,40 +1766,9 @@ impl Engine {
                 }
                 doc = sc.advance();
             }
+            full[i] = whole;
         }
-        // the top-50 correspondents' matches anywhere (the walk may have skipped some)
-        if skipped && let Some(x) = &coll.extra {
-            let addrs: Vec<u64> = x.iter().copied().collect();
-            let q2 = BooleanQuery::new(vec![
-                (Occur::Must, query.box_clone()),
-                (Occur::Must, self.sender_filter(&addrs)),
-            ]);
-            let c2 = Coll {
-                cap: 0,
-                extra: Some(x.clone()),
-                scoring: coll.scoring,
-                bits: coll.bits.clone(),
-                collapse: false,
-                key_cap: 0,
-                early: false,
-                count_need: 0,
-            };
-            acc.ex = self.run(searcher, &q2, &c2)?.extra;
-        }
-        let distinct = if coll.collapse {
-            acc.distinct
-        } else {
-            acc.count
-        };
-        let mut newest = acc.heap.into_vec();
-        newest.sort_unstable_by(|a, b| b.skey.cmp(&a.skey).then(b.mid.cmp(&a.mid)));
-        Ok(Fruit {
-            count: acc.count,
-            distinct,
-            newest,
-            extra: acc.ex,
-            skipped,
-        })
+        Ok((acc, skipped, full))
     }
 
     // ---- query compilation ----
@@ -1749,6 +1999,15 @@ impl Engine {
         (cls, n_stem, n_typo)
     }
 
+    /// The prefix tier of `prefix` in `field` (mail or people index).
+    fn prefix_q(&self, field: Field, prefix: &str) -> PrefixQuery {
+        PrefixQuery {
+            field,
+            prefix: prefix.to_string(),
+            cache: self.pfx.clone(),
+        }
+    }
+
     fn term_query(f: Field, t: &str, rec: IndexRecordOption) -> Box<dyn TQuery> {
         Box::new(TermQuery::new(Term::from_field_text(f, t), rec))
     }
@@ -1795,14 +2054,7 @@ impl Engine {
                         ));
                     }
                     if *prefix && tiers.prefix {
-                        subs.push(boost(
-                            Box::new(FuzzyTermQuery::new_prefix(
-                                Term::from_field_text(f, w),
-                                0,
-                                false,
-                            )),
-                            cw * o.prefix_w,
-                        ));
+                        subs.push(boost(Box::new(self.prefix_q(f, w)), cw * o.prefix_w));
                     }
                     if tiers.stem {
                         for s in stems {
@@ -2050,7 +2302,7 @@ impl Engine {
         let none = PKeys::default();
         for seg in s.segment_readers() {
             self.check_cancel()?;
-            let id = col(seg, "id")?;
+            let id = self.col(seg, "id")?;
             let keys = aff.keys.get(&seg.segment_id()).unwrap_or(&none);
             let mut at = 0;
             let alive = seg.alive_bitset();
@@ -2121,7 +2373,7 @@ impl Engine {
             return Ok((v, 1));
         }
         if n >= 3
-            && let Some(v) = top(&|| Box::new(FuzzyTermQuery::new_prefix(term.clone(), 0, false)))?
+            && let Some(v) = top(&|| Box::new(self.prefix_q(p.f.names, t)))?
         {
             return Ok((v, 2));
         }
@@ -2138,6 +2390,7 @@ impl Engine {
     /// word of `prefix` (the last as a prefix), best first (affinity, then message count).
     pub fn people(&mut self, prefix: &str, cap: usize) -> SResult<Vec<u64>> {
         self.cancel.store(false, Ordering::Relaxed);
+        self.pfx.tick();
         let Some(p) = &self.people else {
             return Ok(Vec::new());
         };
@@ -2153,7 +2406,7 @@ impl Engine {
             .map(|(i, t)| {
                 let term = Term::from_field_text(names, t);
                 let q: Box<dyn TQuery> = if i == last {
-                    Box::new(FuzzyTermQuery::new_prefix(term, 0, false))
+                    Box::new(self.prefix_q(names, t))
                 } else {
                     Box::new(TermQuery::new(term, IndexRecordOption::Basic))
                 };
@@ -2231,8 +2484,8 @@ impl Engine {
                 // quoted text: one walk of (conversation ∧ non-quoted clause ∧ filters), so the
                 // members themselves are never listed (a large thread has thousands)
                 let qconv: Vec<u64> = qhit.iter().map(|(k, _)| cands[*k].conv).collect();
-                let want: HashSet<u64> = qconv.iter().copied().filter(|c| *c != 0).collect();
-                let mut conv_nq: HashSet<u64> = HashSet::new();
+                let want: KeySet = qconv.iter().copied().filter(|c| *c != 0).collect();
+                let mut conv_nq = KeySet::default();
                 if !want.is_empty() {
                     let mut must: Vec<(Occur, Box<dyn TQuery>)> = vec![
                         (
@@ -2247,7 +2500,7 @@ impl Engine {
                     let wm = BooleanQuery::new(must)
                         .weight(EnableScoring::disabled_from_searcher(searcher))?;
                     for seg in segs {
-                        let convc = col(seg, "conv")?;
+                        let convc = self.col(seg, "conv")?;
                         let excl = bits
                             .as_ref()
                             .and_then(|m| m.get(&seg.segment_id()).cloned());
@@ -2447,6 +2700,7 @@ impl Engine {
     /// One query. Clears the cancel flag first.
     pub fn search(&mut self, q: &Query, o: &Opts) -> SResult<Hits> {
         self.cancel.store(false, Ordering::Relaxed);
+        self.pfx.tick();
         let mut info = Vec::new();
         let t_all = Instant::now();
         let searcher = self.mail.reader.searcher();
@@ -2489,7 +2743,7 @@ impl Engine {
         let rank_cap = o.k_rank.max(q.n_top);
         let key_cap = o.count_cap + 1;
         let extra = need_rank.then(|| aff.top50.clone());
-        let mk = |cap, scoring, extra: Option<Arc<HashSet<u64>>>, early, count_need| Coll {
+        let mk = |cap, scoring, extra: Option<Arc<KeySet>>, early, count_need| Coll {
             cap,
             extra,
             scoring,
@@ -2575,7 +2829,7 @@ impl Engine {
         let count_capped = fa.distinct > o.count_cap;
         let fr = fb.as_ref().unwrap_or(&fa);
         // people-first resolution: fuzzy person matches add their messages as candidates
-        let mut pset: HashSet<u64> = HashSet::new();
+        let mut pset = KeySet::default();
         let mut extra_people: Vec<Cand> = Vec::new();
         if o.people_first && self.people.is_some() {
             let tp = Instant::now();
@@ -2641,7 +2895,7 @@ impl Engine {
             };
             let mut dl: Vec<Cand> = newest.to_vec();
             if !extra_people.is_empty() {
-                let have: HashSet<u64> = dl.iter().map(|c| c.mid).collect();
+                let have: KeySet = dl.iter().map(|c| c.mid).collect();
                 dl.extend(
                     extra_people
                         .iter()
@@ -2672,7 +2926,7 @@ impl Engine {
             } else {
                 fr.newest.iter().chain(fr.extra.iter()).copied().collect()
             };
-            let mut have: HashSet<u64> = HashSet::with_capacity(cands.len());
+            let mut have = KeySet::with_capacity_and_hasher(cands.len(), Default::default());
             cands.retain(|c| have.insert(c.mid));
             for c in &extra_people {
                 if have.insert(c.mid) {
@@ -2821,6 +3075,7 @@ impl Engine {
     /// position and ties, exact-term-overlap ambiguity. `targets` are message ids.
     pub fn oracle(&mut self, q: &Query, o: &Opts, targets: &HashSet<u64>) -> SResult<Oracle> {
         self.cancel.store(false, Ordering::Relaxed);
+        self.pfx.tick();
         let searcher = self.mail.reader.searcher();
         let (mut cls, n_stem, mut n_typo) = self.prepare(q, o, &searcher);
         let fl = Filters {
@@ -3068,8 +3323,8 @@ fn collapse<'a>(
     let mut folded: Vec<(u32, u64)> = Vec::new();
     let mut out: Vec<Hit> = Vec::new();
     let mut kept: Vec<Cand> = Vec::new();
-    let mut by_mid: HashMap<u64, usize> = HashMap::new();
-    let mut by_body: HashMap<u64, usize> = HashMap::new();
+    let mut by_mid: KeyMap<usize> = KeyMap::default();
+    let mut by_body: KeyMap<usize> = KeyMap::default();
     for (c, s) in rows {
         if on {
             let found = (c.dup_mid != 0)
