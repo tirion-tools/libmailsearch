@@ -498,6 +498,50 @@ TEST_F(Query, CanonicalRoundTrip) {
   for (const char* in : inputs) expect_round_trip(in);
 }
 
+// A value list is an Or that canonical text prints as `(a OR b)` inside an Or or after `-`, so it follows the depth rule of
+// `(`: at kMaxDepth it keeps its first value (fuzz finding crash-d888eb1a…: 15 nested groups, then `from:j,c` beside an OR,
+// printed a 16th group that re-parsed truncated).
+TEST_F(Query, ValueListFollowsTheDepthRule) {
+  std::string deep;  // the text after it is at depth kMaxDepth - 1
+  for (size_t i = 0; i + 1 < s::kMaxDepth; ++i) deep += "(a ";
+  const std::string one_up = deep.substr(3);
+  const std::string two_up = deep.substr(6);
+  for (const char* tail : {"y OR from:a,b", "y OR tag:x,y", "y OR before:2024,2025", "y OR -from:a,b", "y OR from:-a,b", "from:a,b",
+                           "y OR from:<a@b.c>,<d@e.f>", "y OR from:a,<d@e.f>,me"}) {
+    for (const std::string& lead : {deep, one_up, two_up}) {
+      expect_round_trip("x OR " + lead + tail);
+      expect_round_trip("x " + lead + tail);
+      expect_round_trip("x OR {a " + lead.substr(3) + tail);
+    }
+  }
+  const auto from_terms = [](const s::ParseResult& r) {
+    size_t n = 0;
+    for (const auto& node : r.query.nodes) n += (node.kind == s::NodeKind::kTerm && node.field == s::Field::kFrom) ? 1 : 0;
+    return n;
+  };
+  auto r = parse("x OR " + deep + "y OR from:a,b");
+  EXPECT_EQ(from_terms(r), 1u);
+  EXPECT_TRUE(has_hint(r, s::HintKind::kTruncated));
+  r = parse("x OR " + one_up + "y OR from:a,b");
+  EXPECT_EQ(from_terms(r), 2u);
+  EXPECT_FALSE(has_hint(r, s::HintKind::kTruncated));
+  // Under `-` the list sits one level deeper.
+  for (const char* tail : {"y OR -from:a,b", "y OR from:-a,b"}) {
+    r = parse("x OR " + one_up + tail);
+    EXPECT_EQ(from_terms(r), 1u) << tail;
+    EXPECT_TRUE(has_hint(r, s::HintKind::kTruncated)) << tail;
+    r = parse("x OR " + two_up + tail);
+    EXPECT_EQ(from_terms(r), 2u) << tail;
+  }
+  // One Person of several addresses is not a list.
+  r = parse("x OR " + deep + "y OR from:<a@b.c>,<d@e.f>");
+  EXPECT_FALSE(has_hint(r, s::HintKind::kTruncated));
+  // The minimised fuzz input (cpp/fuzz/corpus/query/regress-value-list-depth-min, mode byte 0).
+  opts.dates.day_first = false;
+  const char kMin[] = "c OR{2{\\" "\0" "{:{c{N{;{5{2{A{c{A{2{,{2{O" "\x01" "from:j,c";
+  expect_round_trip(std::string(kMin, sizeof kMin - 1));
+}
+
 TEST_F(Query, Bounds) {
   std::string long_text(s::kMaxQueryBytes + 100, 'a');
   auto r = parse(long_text);

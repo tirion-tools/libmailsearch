@@ -802,8 +802,12 @@ class Parser {
       ++pos_;
     }
     const std::vector<Item> items = value_items();
+    // A list of values is an Or that canonical text prints as `(a OR b)` inside an Or or after `-`, so the depth rule
+    // of `(` applies to it (one level further under the leading `-`): at kMaxDepth only its first value is kept.
+    const size_t list_depth = depth + (negate ? 1 : 0);
+    const size_t max_alts = list_depth + 1 >= kMaxDepth ? 1 : kMaxListItems;
     text_fallback_ = false;
-    std::optional<uint32_t> node = build_keyword(*kw, typed, items, begin);
+    std::optional<uint32_t> node = build_keyword(*kw, typed, items, max_alts, begin);
     if (node && negate && !text_fallback_) {
       Node n;
       n.kind = NodeKind::kNot;
@@ -906,9 +910,16 @@ class Parser {
     }
   }
 
-  std::optional<uint32_t> build_keyword(const Keyword& kw, const std::string& typed_name, const std::vector<Item>& items, size_t begin) {
+  // At most `max_alts` values become alternatives; the rest are dropped with a kTruncated hint (see keyword()).
+  std::optional<uint32_t> build_keyword(const Keyword& kw, const std::string& typed_name, const std::vector<Item>& items,
+                                        size_t max_alts, size_t begin) {
     if (items.empty()) return as_text(items, begin);
     std::vector<uint32_t> alts;
+    const auto full = [&] {
+      if (alts.size() < max_alts) return false;
+      hint(HintKind::kTruncated, begin, pos_);
+      return true;
+    };
     switch (kw.kind) {
       case KwKind::kUnavailable: {
         std::string value(kw.name);
@@ -936,6 +947,7 @@ class Parser {
           ranges.push_back(std::move(d));
         }
         for (Node& d : ranges) {
+          if (full()) break;
           if (auto id = add(std::move(d), span_from(begin))) alts.push_back(*id);
         }
         break;
@@ -950,6 +962,7 @@ class Parser {
           values.push_back(std::move(*fv));
         }
         for (auto& [k, v] : values) {
+          if (full()) break;
           if (k == FilterKey::kUnavailable) hint(HintKind::kNotAvailable, begin, pos_);
           if (auto id = filter(k, std::move(v), begin)) alts.push_back(*id);
         }
@@ -977,6 +990,7 @@ class Parser {
         }
         size_t next_address = 0;
         for (size_t i = 0; i < items.size(); ++i) {
+          if (full()) break;
           const Item& it = items[i];
           if (next_address < address_items.size() && address_items[next_address] == i) {
             Node n;

@@ -22,7 +22,7 @@ inline constexpr uint32_t kGrammarVersion = 1;
 // Bounds (the parser never fails: input past them is ignored with a kTruncated hint).
 inline constexpr size_t kMaxQueryBytes = 4096;  // largest query text (also the saved-query bound)
 inline constexpr size_t kMaxNodes = 256;  // leaf and Not nodes; And/Or groups come on top
-inline constexpr size_t kMaxDepth = 16;
+inline constexpr size_t kMaxDepth = 16;  // groups, `-` and value lists (`from:a,b`): at the limit a list keeps its first value
 inline constexpr size_t kMaxListItems = 32;  // values in one `from:a,b,…` / addresses in a Person
 
 // Open ends of a DateRange.
