@@ -134,6 +134,11 @@ FUZZ_SECONDS=600 tools/container.sh tools/gate.sh fuzz
 The library ships no binaries. Consumers pin a commit. `.github/workflows/` mirrors the gate for when the repository is
 hosted.
 
+## Contributing
+
+This repository is not accepting contributions at this time: issues and pull requests are not accepted. Report
+security vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
+
 ## Licence
 
-MIT, see `LICENSE`.
+MIT, see `LICENSE`. Third-party material: `THIRD-PARTY-NOTICES.md`.
