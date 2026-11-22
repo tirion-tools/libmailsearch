@@ -17,7 +17,7 @@ mailsearch-core = { path = "core" }
 # The exact Tantivy version is part of the index VERSION stamp (core/src/lib.rs); consumers keep `=`.
 tantivy = { version = "=0.27.0", default-features = false, features = ["mmap", "lz4-compression", "stemmer"] }
 # Tantivy's stemmer build (its `stemmer` feature), same version and these languages a subset of its set
-frostem = { version = "=1.20260821.8", default-features = false, features = ["danish", "dutch", "english", "finnish", "french", "german", "greek", "hungarian", "italian", "norwegian", "portuguese", "romanian", "russian", "spanish", "swedish", "turkish"] }
+frostem = { version = "=2.20261016.3", default-features = false, features = ["danish", "dutch", "english", "finnish", "french", "german", "greek", "hungarian", "italian", "norwegian", "portuguese", "romanian", "russian", "spanish", "swedish", "turkish"] }
 unicode-normalization = "0.1"
 memmap2 = "0.9"
 stable_deref_trait = "1"
