@@ -81,7 +81,19 @@ pub fn build() -> Pristine {
     let files = files
         .into_iter()
         .map(|p| {
+            #[cfg(unix)]
             let b = std::fs::read(&p).unwrap();
+            // The writer `w` still holds its lock files, which Windows locks against reading; they are empty.
+            #[cfg(windows)]
+            let b = match std::fs::read(&p) {
+                Err(e)
+                    if e.raw_os_error() == Some(33)
+                        && std::fs::metadata(&p).unwrap().len() == 0 =>
+                {
+                    Vec::new()
+                }
+                r => r.unwrap(),
+            };
             (p.strip_prefix(&root).unwrap().to_path_buf(), b)
         })
         .collect();

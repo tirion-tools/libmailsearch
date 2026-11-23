@@ -13,6 +13,8 @@
 pub mod dir;
 pub mod engine;
 mod highlight;
+#[cfg(windows)]
+mod win;
 
 use engine::{Clause, Engine, KeySet, Mode, OpenError, Opts, Query, SearchError};
 use std::cell::{RefCell, UnsafeCell};

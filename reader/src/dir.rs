@@ -1,12 +1,15 @@
 //! The reader's own read-only Tantivy directory: every file is mapped once and registered, so [`RoDir::advise_all`] can
-//! `madvise(MADV_DONTNEED)` every live mapping and drop its pages from this process. Writes, deletes
-//! and locks are refused: the indexer is the only writer. A segment file Tantivy decodes at open
-//! (`mailsearch_core::integrity`) is checked against its footer CRC when it is first mapped; a
-//! mismatch fails the open and is remembered ([`RoDir::corrupt`]).
+//! `madvise(MADV_DONTNEED)` every live mapping (Windows: `VirtualUnlock`, `crate::win::release`) and drop its pages
+//! from this process. Writes, deletes and locks are refused: the indexer is the only writer. A segment file
+//! Tantivy decodes at open (`mailsearch_core::integrity`) is checked against its footer CRC when it is first mapped;
+//! a mismatch fails the open and is remembered ([`RoDir::corrupt`]).
 
+#[cfg(windows)]
+use crate::win::FileExt;
 use std::collections::HashMap;
 use std::io;
 use std::ops::{Deref, Range};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -128,6 +131,7 @@ impl RoDir {
                 // SAFETY: the range is exactly one live read-only file mapping held by `m`;
                 // MADV_DONTNEED on a file-backed private read-only mapping only drops pages,
                 // later reads fault them back in from the file.
+                #[cfg(unix)]
                 unsafe {
                     libc::madvise(
                         m.as_ptr() as *mut libc::c_void,
@@ -135,6 +139,8 @@ impl RoDir {
                         libc::MADV_DONTNEED,
                     )
                 };
+                #[cfg(windows)]
+                crate::win::release(&m);
                 n += m.len() as u64;
             }
         }

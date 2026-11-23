@@ -923,7 +923,8 @@ pub const PREFETCH_EXTS: [&str; 3] = ["term", "fast", "fieldnorm"];
 pub const PREFETCH_CHUNK: u64 = 2 << 20;
 
 /// [`Engine::prefetch`]'s thread: readahead for every file, then a read of the pages still not in the page
-/// cache. Errors are ignored (a file gone after a reload is no longer needed).
+/// cache. Errors are ignored (a file gone after a reload is no longer needed). Windows: `crate::win::prefetch_files`.
+#[cfg(unix)]
 fn prefetch_files(files: &[(PathBuf, u64)]) {
     use std::os::fd::AsRawFd;
     let open: Vec<(std::fs::File, u64)> = files
@@ -952,8 +953,12 @@ fn prefetch_files(files: &[(PathBuf, u64)]) {
     }
 }
 
+#[cfg(windows)]
+use crate::win::prefetch_files;
+
 /// Reads the pages of `f` (`n` bytes) that are not in the page cache (`mincore`), so a warm prefetch reads
 /// nothing.
+#[cfg(unix)]
 fn read_missing(f: &std::fs::File, n: u64, buf: &mut [u8]) {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
@@ -1665,8 +1670,9 @@ impl Engine {
     /// `POSIX_FADV_WILLNEED` in [`PREFETCH_CHUNK`] steps (one call reads ahead at most the device's
     /// largest request, 2 MiB here), then reads what `mincore` still shows missing. It reads through file
     /// descriptors, not the reader's mappings, so nothing is mapped into this process, and a warm prefetch
-    /// costs only the page cache lookups. Returns the bytes it will read and the thread, or `None` while an earlier
-    /// prefetch is still running.
+    /// costs only the page cache lookups (Windows, which has neither call: one read of every file through its
+    /// descriptor, `crate::win::prefetch_files`). Returns the bytes it will read and the thread, or `None` while an
+    /// earlier prefetch is still running.
     pub fn prefetch(&self) -> std::io::Result<Option<(u64, std::thread::JoinHandle<()>)>> {
         if self.prefetching.swap(true, Ordering::AcqRel) {
             return Ok(None);

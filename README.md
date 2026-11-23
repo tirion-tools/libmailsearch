@@ -94,7 +94,8 @@ needs a profile with the same setting. Consumers of the C++ part `add_subdirecto
   then still abort the process. A caller that maps an index written by another process keeps a crash guard keyed on
   `mailsearch_current` (the directory to refuse after a crash inside the reader). "At most 3 typo candidates per term"
   is not enforced: the typo tier uses Tantivy's `FuzzyTermQuery` (distance 1, transpositions) as is. Linux and other
-  Unix targets (the reader uses `madvise`).
+  Unix targets (the reader uses `madvise`), and Windows (`reader/src/win.rs`: `VirtualUnlock` for the release, a plain
+  read of every file for the prefetch, which has no residency check there).
 
 ## Tests
 
